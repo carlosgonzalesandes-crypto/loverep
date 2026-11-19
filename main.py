@@ -34,7 +34,11 @@ from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet, InvalidToken
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import CreateForumTopicRequest, GetChannelsRequest
+from telethon.tl.functions.channels import GetChannelsRequest
+try:
+    from telethon.tl.functions.channels import CreateForumTopicRequest
+except ImportError:
+    from telethon.tl.functions.messages import CreateForumTopicRequest
 from telethon.tl.types import DocumentAttributeVideo, InputChannel, InputPeerChannel
 
 from instagrapi import Client as IGClient
@@ -551,7 +555,11 @@ class App:
             if not self.use_topics:
                 return None
             try:
-                res = await self.client(CreateForumTopicRequest(channel=self.chat, title=f"@{user}"))
+                                try:
+                    req = CreateForumTopicRequest(channel=self.chat, title=f"@{user}")
+                except TypeError:
+                    req = CreateForumTopicRequest(peer=self.chat, title=f"@{user}")
+                res = await self.client(req)
                 tid = None
                 for u in getattr(res, "updates", []):
                     m = getattr(u, "message", None)

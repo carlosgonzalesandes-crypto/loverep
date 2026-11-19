@@ -35,10 +35,6 @@ from cryptography.fernet import Fernet, InvalidToken
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import GetChannelsRequest
-try:
-    from telethon.tl.functions.channels import CreateForumTopicRequest
-except ImportError:
-    from telethon.tl.functions.messages import CreateForumTopicRequest
 from telethon.tl.types import DocumentAttributeVideo, InputChannel, InputPeerChannel
 
 from instagrapi import Client as IGClient
@@ -50,6 +46,23 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("instagrapi").setLevel(logging.WARNING)
 logging.getLogger("private_request").setLevel(logging.WARNING)
 logging.getLogger("public_request").setLevel(logging.WARNING)
+
+
+def make_topic_request(chat, title):
+    """Crea la petición de 'nuevo tema' sin depender de la versión de Telethon."""
+    cls = None
+    for mod in ("telethon.tl.functions.channels", "telethon.tl.functions.messages"):
+        try:
+            cls = getattr(__import__(mod, fromlist=["x"]), "CreateForumTopicRequest")
+            break
+        except (ImportError, AttributeError):
+            continue
+    if cls is None:
+        raise RuntimeError("Esta versión de Telethon no soporta temas de foro")
+    try:
+        return cls(channel=chat, title=title)
+    except TypeError:
+        return cls(peer=chat, title=title)
 
 
 # ============================================================================
@@ -555,11 +568,7 @@ class App:
             if not self.use_topics:
                 return None
             try:
-                                try:
-                    req = CreateForumTopicRequest(channel=self.chat, title=f"@{user}")
-                except TypeError:
-                    req = CreateForumTopicRequest(peer=self.chat, title=f"@{user}")
-                res = await self.client(req)
+                res = await self.client(make_topic_request(self.chat, f"@{user}"))
                 tid = None
                 for u in getattr(res, "updates", []):
                     m = getattr(u, "message", None)

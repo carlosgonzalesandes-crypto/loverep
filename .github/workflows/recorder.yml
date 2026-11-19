@@ -1,0 +1,63 @@
+name: recorder
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"   # red de seguridad: si se cae, se reinicia solo
+
+concurrency:
+  group: recorder
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # guarda el estado cifrado en la rama "state"
+  actions: write    # para relanzarse a sí mismo
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Asegurar ffmpeg
+        run: command -v ffmpeg >/dev/null || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+
+      - name: Preparar rama de estado (cifrado)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$REPO_URL" state >/dev/null 2>&1; then
+            git clone --depth 1 --branch state "$REPO_URL" data
+          else
+            mkdir data && cd data
+            git init -q -b state
+            git remote add origin "$REPO_URL"
+          fi
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar grabador
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          IG_PROXY: ${{ secrets.IG_PROXY }}
+          TZ_NAME: America/Lima
+        run: python main.py
+
+      - name: Relanzar el siguiente turno (24/7)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run recorder.yml --repo "$GITHUB_REPOSITORY"

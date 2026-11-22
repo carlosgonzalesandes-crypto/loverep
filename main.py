@@ -241,7 +241,7 @@ class Instagram:
         self.cl = None
         self.ok = False
         self.user = state.data.get("ig_user")
-        self._endpoint = None
+        self.last_info = None
         self._restore()
 
     def _new_client(self):
@@ -307,62 +307,73 @@ class Instagram:
         return True, f"✅ Sesión iniciada como @{self.user}. Ya busco lives de quienes sigues."
 
     # --- lives en vivo de las cuentas que sigues (corre en un hilo) ---
-    def live_broadcasts(self):
+    def _fetch_tray(self, name):
         cl = self.cl
-        res = None
-        errs = []
-        attempts = [self._endpoint] if self._endpoint else ["tray_get", "tray_post"]
-        for name in attempts:
+        if name == "tray_get":
+            return cl.private_request("feed/reels_tray/")
+        return cl.private_request(
+            "feed/get_reels_tray_feed/",
+            data={
+                "reason": "pull_to_refresh",
+                "timezone_offset": "-18000",
+                "tray_session_id": cl.generate_uuid(),
+                "request_id": cl.generate_uuid(),
+                "page_size": 50,
+                "_uuid": cl.uuid,
+            },
+        )
+
+    @staticmethod
+    def _parse_broadcast(b):
+        owner = b.get("broadcast_owner") or {}
+        if b.get("broadcast_status") not in (None, "active", "interrupted"):
+            return None
+        url = b.get("dash_playback_url") or b.get("dash_abr_playback_url")
+        if not (b.get("id") and owner.get("username") and url):
+            return None
+        return {
+            "id": str(b["id"]),
+            "username": owner["username"],
+            "url": url,
+            "abr": b.get("dash_abr_playback_url"),
+            "title": b.get("broadcast_message") or "",
+        }
+
+    def live_broadcasts(self):
+        """Consulta las DOS rutas de Instagram cada vez y junta los resultados."""
+        found = {}
+        info = {"time": time.time(), "endpoints": {}, "total": 0}
+        any_ok = False
+        for name in ("tray_post", "tray_get"):
             try:
-                if name == "tray_get":
-                    res = cl.private_request("feed/reels_tray/")
-                else:
-                    res = cl.private_request(
-                        "feed/get_reels_tray_feed/",
-                        data={
-                            "reason": "pull_to_refresh",
-                            "timezone_offset": "-18000",
-                            "tray_session_id": cl.generate_uuid(),
-                            "request_id": cl.generate_uuid(),
-                            "page_size": 50,
-                            "_uuid": cl.uuid,
-                        },
-                    )
-                if isinstance(res, dict) and ("broadcasts" in res or "tray" in res):
-                    self._endpoint = name
-                    break
-                res = None
+                res = self._fetch_tray(name)
             except Exception as e:
                 msg = str(e).lower()
                 if any(k in msg for k in ("login_required", "checkpoint", "challenge_required")):
                     raise
-                errs.append(f"{name}: {e}")
-                res = None
-        if res is None:
-            raise RuntimeError("No pude leer el tray de IG: " + " | ".join(errs)[:300])
-
-        raw = list(res.get("broadcasts") or [])
-        for item in res.get("tray") or []:
-            if isinstance(item, dict) and item.get("broadcast"):
-                raw.append(item["broadcast"])
-
-        out = {}
-        for b in raw:
-            owner = b.get("broadcast_owner") or {}
-            status = b.get("broadcast_status")
-            if status not in (None, "active", "interrupted"):
+                info["endpoints"][name] = "error: " + str(e)[:150]
                 continue
-            url = b.get("dash_playback_url") or b.get("dash_abr_playback_url")
-            if not (b.get("id") and owner.get("username") and url):
+            if not isinstance(res, dict):
+                info["endpoints"][name] = "respuesta vacia"
                 continue
-            out[str(b["id"])] = {
-                "id": str(b["id"]),
-                "username": owner["username"],
-                "url": url,
-                "abr": b.get("dash_abr_playback_url"),
-                "title": b.get("broadcast_message") or "",
-            }
-        return list(out.values())
+            any_ok = True
+            raw = list(res.get("broadcasts") or [])
+            for item in res.get("tray") or []:
+                if isinstance(item, dict) and item.get("broadcast"):
+                    raw.append(item["broadcast"])
+            n_ok = 0
+            for b in raw:
+                parsed = self._parse_broadcast(b)
+                if parsed:
+                    found[parsed["id"]] = parsed
+                    n_ok += 1
+            keys = ",".join(sorted(res.keys())[:6])
+            info["endpoints"][name] = f"ok | lives={len(raw)} validos={n_ok} | claves: {keys}"
+        info["total"] = len(found)
+        self.last_info = info
+        if not any_ok:
+            raise RuntimeError("No pude leer Instagram: " + " | ".join(info["endpoints"].values())[:300])
+        return list(found.values())
 
 
 # ============================================================================
@@ -626,6 +637,7 @@ class App:
         "/login usuario clave [codigo2FA] – iniciar sesión\n"
         "/sessionid VALOR – iniciar sesión con la cookie (más confiable)\n"
         "/estado – qué se está grabando\n"
+        "/diag – diagnóstico de la última consulta a Instagram\n"
         "/ignorar usuario – no grabar a esa cuenta\n"
         "/permitir usuario – volver a grabarla\n"
         "/solo usuario1 usuario2 – grabar SOLO a esas cuentas\n"
@@ -669,6 +681,16 @@ class App:
             if ok:
                 self.session_alert_sent = False
             await msg.edit(txt)
+
+        elif cmd == "/diag":
+            i = self.ig.last_info
+            if not i:
+                await reply("Aun no he consultado Instagram.", parse_mode=None)
+            else:
+                lines = [f"Ultima consulta hace {int(time.time() - i['time'])}s | sesion: {'OK' if self.ig.ok else 'caida'}"]
+                lines += [f"- {k}: {v}" for k, v in i["endpoints"].items()]
+                lines.append(f"Lives detectados: {i['total']}")
+                await reply("\n".join(lines), parse_mode=None)
 
         elif cmd == "/estado":
             lines = [f"👤 Instagram: {'@' + str(self.ig.user) if self.ig.ok else '❌ sin sesión'}"]
@@ -773,6 +795,7 @@ class App:
             try:
                 lives = await asyncio.to_thread(self.ig.live_broadcasts)
                 errors = 0
+                log.info("Consulta IG: %d live(s) detectado(s) | %s", len(lives), (self.ig.last_info or {}).get("endpoints"))
                 await self.handle_lives(lives)
                 if time.time() - last_save > 1800:
                     last_save = time.time()

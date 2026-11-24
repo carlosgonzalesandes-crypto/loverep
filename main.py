@@ -215,9 +215,7 @@ class State:
             "ig_user": None,
             "tg_session": "",      # sesión del bot de Telegram
             "topics": {},          # usuario -> id del tema en el grupo
-            "ignore": [],          # usuarios que NO se graban
             "only": [],            # si no está vacío: solo se graban estos
-            "watch": [],           # cuentas vigiladas una por una (respaldo)
             "pks": {},             # usuario -> id numérico (caché)
             "following": None,     # cuántas cuentas sigues (se actualiza solo)
         }
@@ -274,7 +272,6 @@ class Instagram:
         self.ok = False
         self.user = state.data.get("ig_user")
         self.last_info = None
-        self._watch_idx = 0
         self.following = state.data.get("following")
         self.following_time = None
         self._restore()
@@ -360,11 +357,11 @@ class Instagram:
 
     @staticmethod
     def _parse_broadcast(b, default_user=None):
-        owner = b.get("broadcast_owner") or {}
+        owner = b.get("broadcast_owner") or b.get("owner") or b.get("user") or {}
         username = owner.get("username") or default_user
-        if b.get("broadcast_status") not in (None, "active", "interrupted"):
+        if b.get("broadcast_status") in ("stopped", "ended", "hard_stop"):
             return None
-        url = b.get("dash_playback_url") or b.get("dash_abr_playback_url")
+        url = b.get("dash_playback_url") or b.get("dash_abr_playback_url") or b.get("playback_url")
         if not (b.get("id") and username and url):
             return None
         return {
@@ -375,10 +372,15 @@ class Instagram:
             "title": b.get("broadcast_message") or "",
         }
 
+    @staticmethod
+    def _describe(b):
+        """Resumen de un live que no se pudo leer (para diagnóstico)."""
+        return f"{b.get('id')}: claves={','.join(sorted(b.keys())[:30])}"
+
     def live_broadcasts(self):
-        """Lista de lives: bandeja general de IG + vigilancia directa de cuentas elegidas."""
+        """Lista de lives de las cuentas que sigues (bandeja general de Instagram)."""
         found = {}
-        info = {"time": time.time(), "endpoints": {}, "total": 0, "watch": []}
+        info = {"time": time.time(), "endpoints": {}, "total": 0, "unparsed": []}
         tray_ok = False
         try:
             res = self._fetch_tray("tray_get")
@@ -394,6 +396,8 @@ class Instagram:
                     if parsed:
                         found[parsed["id"]] = parsed
                         n_ok += 1
+                    else:
+                        info["unparsed"].append(self._describe(b))
                 keys = ",".join(sorted(res.keys())[:6])
                 info["endpoints"]["bandeja"] = f"ok | lives={len(raw)} validos={n_ok} | claves: {keys}"
             else:
@@ -404,41 +408,9 @@ class Instagram:
                 raise
             info["endpoints"]["bandeja"] = "error: " + str(e)[:150]
 
-        # Vigilancia directa (respaldo): revisa 4 cuentas por ronda, en rotación
-        watch = list(self.state.data.get("watch", []))
-        watch_ok = False
-        if watch:
-            batch = []
-            for _ in range(min(4, len(watch))):
-                batch.append(watch[self._watch_idx % len(watch)])
-                self._watch_idx += 1
-            for u in batch:
-                try:
-                    pk = self.state.data["pks"].get(u)
-                    if not pk:
-                        pk = str(self.cl.user_id_from_username(u))
-                        self.state.data["pks"][u] = pk
-                    res = self.cl.private_request(f"feed/user/{pk}/story/")
-                    b = (res or {}).get("broadcast")
-                    watch_ok = True
-                    if b:
-                        parsed = self._parse_broadcast(b, default_user=u)
-                        if parsed:
-                            found[parsed["id"]] = parsed
-                            info["watch"].append(f"{u}: EN VIVO")
-                        else:
-                            info["watch"].append(f"{u}: live sin url")
-                    else:
-                        info["watch"].append(f"{u}: no esta en vivo")
-                except Exception as e:
-                    msg = str(e).lower()
-                    if any(k in msg for k in ("login_required", "checkpoint", "challenge_required")):
-                        raise
-                    info["watch"].append(f"{u}: error {str(e)[:70]}")
-
         info["total"] = len(found)
         self.last_info = info
-        if not tray_ok and not watch_ok:
+        if not tray_ok:
             raise RuntimeError("No pude leer Instagram: " + " | ".join(info["endpoints"].values())[:300])
         return list(found.values())
 
@@ -525,6 +497,9 @@ class Instagram:
         try:
             info = self.cl.user_info_v1(self.cl.user_id)
             n = int(info.following_count)
+            if not self.user and getattr(info, "username", None):
+                self.user = info.username
+                self.state.data["ig_user"] = self.user
         except Exception as e:
             if self._is_login_error(e):
                 raise
@@ -711,6 +686,7 @@ class App:
         self.use_topics = True
         self.session_alert_sent = False
         self.pending = None       # lo que espera el menú (enlace, usuarios…)
+        self.unparsed_seen = set()
         self.client.parse_mode = "html"
 
     # ---------- Telegram ----------
@@ -789,8 +765,6 @@ class App:
     def allowed(self, user):
         u = user.lower()
         d = self.state.data
-        if u in d["ignore"]:
-            return False
         return (not d["only"]) or (u in d["only"])
 
     # ---------- enlaces / búsqueda manual ----------
@@ -808,7 +782,7 @@ class App:
         except Exception as e:
             return "❌ Error consultando Instagram: " + html.escape(str(e)[:200])
         if not b:
-            return "⚪ " + html.escape(note) + "\nSi quieres que lo grabe en cuanto empiece, usa 👀 Vigilar."
+            return "⚪ " + html.escape(note) + "\nLos lives de las cuentas que sigues se graban solos cuando empiezan."
         if b["id"] in self.active:
             return "ℹ️ Ese live ya se está grabando."
         rec = Recording(self, b, manual=True)
@@ -852,13 +826,12 @@ class App:
         "❓ <b>Ayuda</b>\n\n"
         "• <b>Automático:</b> graba solo los lives de las cuentas que sigues.\n"
         "• <b>Por enlace:</b> pega un enlace de un live (o el @usuario) y lo grabo.\n"
-        "• <b>Vigilar:</b> revisa cuentas concretas una por una (respaldo).\n"
         "• Los videos llegan al grupo, un tema por usuario, con fecha y hora.\n\n"
         "<b>Comandos:</b>\n"
         "/menu · /estado · /siguiendo · /diag · /grabar enlace\n"
         "/login usuario clave [2FA] · /sessionid VALOR\n"
-        "/solo u1 u2 · /todos · /ignorar u · /permitir u\n"
-        "/vigilar u1 u2 · /novigilar u · /lista"
+        "/solo u1 u2 · /todos\n"
+        "/lista"
     )
 
     @staticmethod
@@ -877,8 +850,6 @@ class App:
             f"{self.following_line()}\n"
             f"🔴 Grabando ahora: {len(self.active)}\n"
             f"🎯 Modo: {modo}\n"
-            f"👀 Cuentas vigiladas: {len(d['watch'])}\n"
-            f"🚫 Ignoradas: {len(d['ignore'])}\n"
             f"⏱ Consulta cada {CFG.poll} segundos\n"
             f"⏳ Turno actual termina en {fmt_dur(left)}\n\n"
             "Selecciona una opción:"
@@ -888,10 +859,9 @@ class App:
         B = Button.inline
         return [
             [B("📊 Estado", b"estado"), B("🔴 En vivo ahora", b"vivo")],
-            [B("🔗 Grabar enlace", b"grabar"), B("👀 Vigilar", b"vigilar")],
-            [B("🎯 Solo cuentas", b"solo"), B("🚫 Ignoradas", b"ignorar")],
-            [B("🩺 Diagnóstico", b"diag"), B("🔑 Sesión IG", b"sesion")],
-            [B("❓ Ayuda", b"ayuda"), B("🔄 Actualizar", b"menu")],
+            [B("🔗 Grabar enlace", b"grabar"), B("🔑 Sesión IG", b"sesion")],
+            [B("🎯 Solo cuentas", b"solo"), B("🩺 Diagnóstico", b"diag")],
+            [B("❓ Ayuda", b"ayuda")],
         ]
 
     def estado_text(self):
@@ -914,7 +884,6 @@ class App:
         lines = [f"🩺 <b>Diagnóstico</b>\n\nÚltima consulta hace {int(time.time() - i['time'])} s · "
                  f"sesión: {'OK' if self.ig.ok else 'caída'}"]
         lines += [f"• {html.escape(k)}: {html.escape(str(v))}" for k, v in i["endpoints"].items()]
-        lines += [f"• vigilar {html.escape(w)}" for w in i.get("watch", [])]
         lines.append(f"Lives detectados: {i['total']}")
         return "\n".join(lines)
 
@@ -946,17 +915,6 @@ class App:
                 "Ejemplos:\n<code>https://www.instagram.com/usuario/live/</code>\n<code>@usuario</code>\n\n"
                 "También puedes pegar un enlace en cualquier momento, sin abrir este menú."
             ), [back]
-        if key == "vigilar":
-            self.pending = "vigilar"
-            lst = ", ".join("@" + html.escape(w) for w in d["watch"]) or "—"
-            return (
-                "👀 <b>Vigilar cuentas</b>\n\nRevisaré estas cuentas directamente en cada ronda.\n"
-                f"Ahora: {lst}\n\nEnvíame los @usuarios que quieres añadir (separados por espacio)."
-            ), [[B("🗑 Vaciar lista", b"vigilar_clear")], back]
-        if key == "vigilar_clear":
-            d["watch"] = []
-            await asyncio.to_thread(self.state.save)
-            return await self.screen("vigilar", event)
         if key == "solo":
             self.pending = "solo"
             lst = ", ".join("@" + html.escape(w) for w in d["only"]) or "todas las que sigues"
@@ -968,17 +926,6 @@ class App:
             d["only"] = []
             await asyncio.to_thread(self.state.save)
             return await self.screen("solo", event)
-        if key == "ignorar":
-            self.pending = "ignorar"
-            lst = ", ".join("@" + html.escape(w) for w in d["ignore"]) or "—"
-            return (
-                "🚫 <b>Cuentas ignoradas</b>\n\nNo las grabaré aunque hagan live.\n"
-                f"Ahora: {lst}\n\nEnvíame los @usuarios que quieres ignorar (separados por espacio)."
-            ), [[B("✅ Quitar todas", b"ignorar_clear")], back]
-        if key == "ignorar_clear":
-            d["ignore"] = []
-            await asyncio.to_thread(self.state.save)
-            return await self.screen("ignorar", event)
         if key == "diag":
             return self.diag_text(), [[B("🔄 Actualizar", b"diag")], back]
         if key == "sesion":
@@ -1050,22 +997,10 @@ class App:
         if pend == "grabar" or (pend is None and LINK_RE.search(text)):
             msg = await event.reply("⏳ Buscando el live…")
             await msg.edit(await self.record_target(text), buttons=back)
-        elif pend == "vigilar":
-            for u in self._names(text):
-                if u not in d["watch"]:
-                    d["watch"].append(u)
-            await asyncio.to_thread(self.state.save)
-            await event.reply("👀 Vigilando: " + ", ".join("@" + html.escape(w) for w in d["watch"]), buttons=back)
         elif pend == "solo":
             d["only"] = self._names(text)
             await asyncio.to_thread(self.state.save)
             await event.reply("🎯 Solo grabaré: " + ", ".join("@" + html.escape(w) for w in d["only"]), buttons=back)
-        elif pend == "ignorar":
-            for u in self._names(text):
-                if u not in d["ignore"]:
-                    d["ignore"].append(u)
-            await asyncio.to_thread(self.state.save)
-            await event.reply("🚫 Ignoradas: " + ", ".join("@" + html.escape(w) for w in d["ignore"]), buttons=back)
         elif pend == "sessionid":
             msg = await event.reply("⏳ Verificando sesión…")
             ok, txt = await asyncio.to_thread(self.ig.login_sessionid, text.split()[0])
@@ -1135,18 +1070,6 @@ class App:
             await reply(self.estado_text(), buttons=back)
         elif cmd == "/diag":
             await reply(self.diag_text(), buttons=back)
-        elif cmd == "/ignorar" and args:
-            for u in self._names(" ".join(args)):
-                if u not in d["ignore"]:
-                    d["ignore"].append(u)
-            await asyncio.to_thread(self.state.save)
-            await reply("🚫 Ignoradas: " + ", ".join("@" + html.escape(w) for w in d["ignore"]), buttons=back)
-        elif cmd == "/permitir" and args:
-            u = args[0].lstrip("@").lower()
-            if u in d["ignore"]:
-                d["ignore"].remove(u)
-            await asyncio.to_thread(self.state.save)
-            await reply(f"✅ @{html.escape(u)} vuelve a grabarse", buttons=back)
         elif cmd == "/solo" and args:
             d["only"] = self._names(" ".join(args))
             await asyncio.to_thread(self.state.save)
@@ -1155,23 +1078,9 @@ class App:
             d["only"] = []
             await asyncio.to_thread(self.state.save)
             await reply("🌐 Grabaré a todas las cuentas que sigues.", buttons=back)
-        elif cmd == "/vigilar" and args:
-            for u in self._names(" ".join(args)):
-                if u not in d["watch"]:
-                    d["watch"].append(u)
-            await asyncio.to_thread(self.state.save)
-            await reply("👀 Vigilando: " + ", ".join("@" + html.escape(w) for w in d["watch"]), buttons=back)
-        elif cmd == "/novigilar" and args:
-            u = args[0].lstrip("@").lower()
-            if u in d["watch"]:
-                d["watch"].remove(u)
-            await asyncio.to_thread(self.state.save)
-            await reply(f"Dejé de vigilar a @{html.escape(u)}", buttons=back)
         elif cmd == "/lista":
             await reply(
-                f"🚫 Ignorados: {html.escape(', '.join(d['ignore']) or '—')}\n"
-                f"🎯 Solo: {html.escape(', '.join(d['only']) or '— (todos)')}\n"
-                f"👀 Vigilando: {html.escape(', '.join(d['watch']) or '—')}",
+                f"🎯 Solo: {html.escape(', '.join(d['only']) or '— (todas las que sigues)')}",
                 buttons=back,
             )
         else:
@@ -1242,6 +1151,14 @@ class App:
                 errors = 0
                 log.info("Consulta IG: %d live(s) detectado(s) | %s", len(lives), (self.ig.last_info or {}).get("endpoints"))
                 await self.handle_lives(lives)
+                for u in (self.ig.last_info or {}).get("unparsed", []):
+                    key = u.split(":")[0]
+                    if key not in self.unparsed_seen:
+                        self.unparsed_seen.add(key)
+                        await self.notify(
+                            "⚠️ Detecté un live pero no pude leer su enlace de video. "
+                            "Mándale este mensaje a Claude para arreglarlo:\n" + u[:700]
+                        )
                 if time.time() - last_follow > 1800:
                     last_follow = time.time()
                     await self.refresh_following(force=True)

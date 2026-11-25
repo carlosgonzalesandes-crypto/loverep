@@ -27,11 +27,15 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from urllib.parse import urljoin
 from collections import deque
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import requests
 from cryptography.fernet import Fernet, InvalidToken
 from telethon import Button, TelegramClient, events
 from telethon.sessions import StringSession
@@ -94,6 +98,43 @@ def parse_target(text):
     return (username.lower() if username else None), bid
 
 
+def classify_link(text):
+    """Clasifica un enlace de Instagram: live, post/reel, historia, historias de un usuario o perfil."""
+    t = text.strip()
+    m = LINK_RE.search(t)
+    if not m:
+        user, bid = parse_target(t)
+        if bid:
+            return {"kind": "live", "user": user, "bid": bid, "url": None}
+        if user:
+            return {"kind": "profile", "user": user, "bid": None, "url": None}
+        return {"kind": "none", "user": None, "bid": None, "url": None}
+    url = m.group(0).split("?")[0].rstrip("/")
+    parts = [p for p in url.split("instagram.com/", 1)[1].split("/") if p]
+    low = [p.lower() for p in parts]
+    user, bid = parse_target(m.group(0))
+    link = {"kind": "none", "user": user, "bid": bid, "url": url}
+    for marker in ("p", "reel", "reels", "tv"):
+        if marker in low and low.index(marker) + 1 < len(parts):
+            link["kind"] = "post"
+            return link
+    if low and low[0] == "stories":
+        if len(parts) > 1 and low[1] == "highlights":
+            link["kind"] = "highlight"
+        elif len(parts) > 2 and parts[2].isdigit():
+            link["kind"] = "story"
+        elif len(parts) > 1:
+            link["kind"] = "stories_user"
+            link["user"] = parts[1].lower()
+        return link
+    if "live" in low or bid:
+        link["kind"] = "live"
+    elif parts:
+        link["kind"] = "profile"
+        link["user"] = parts[0].lower()
+    return link
+
+
 # ============================================================================
 # CONFIGURACIÓN  (todo se puede cambiar desde los Secrets / variables del workflow)
 # ============================================================================
@@ -119,7 +160,8 @@ def load_config():
         pick_batch=int(_env("PICK_BATCH", "10")),          # perfiles marcados revisados por ronda
         poll=int(_env("POLL_SECONDS", "45")),             # cada cuántos seg. busca lives nuevos
         max_runtime=int(_env("MAX_RUNTIME_MIN", "345")) * 60,  # turno de GitHub (máx 6h)
-        segment=int(_env("SEGMENT_SECONDS", "2400")),     # corta partes de 40 min (límite Telegram 2GB)
+        segment=int(_env("SEGMENT_SECONDS", "1200")),     # partes de 20 min: salen a Telegram mientras el live sigue
+        backfill_max=int(_env("BACKFILL_SEGMENTS", "6000")),  # cuántos segmentos viejos bajar al detectar tarde
         data_dir=_env("DATA_DIR", "data"),
         rec_dir=_env("REC_DIR", "recordings"),
     )
@@ -174,6 +216,102 @@ async def probe_video(path):
         return float(j["format"]["duration"]), int(s["width"]), int(s["height"])
     except Exception:
         return 0.0, 0, 0
+
+
+# ---------- DASH: lectura del manifiesto y descarga por segmentos numerados ----------
+def _tag(el):
+    return el.tag.split("}")[-1]
+
+
+def _fill_template(tpl, rep, number=None, time_=None):
+    out = tpl.replace("$RepresentationID$", str(rep["id"])).replace("$Bandwidth$", str(rep["bw"]))
+
+    def sub(m):
+        val = number if m.group(1) == "Number" else time_
+        if val is None:
+            return m.group(0)
+        return (m.group(2) % val) if m.group(2) else str(val)
+
+    out = re.sub(r"\$(Number|Time)(%0\d+d)?\$", sub, out)
+    return out.replace("$$", "$")
+
+
+def parse_mpd(xml_text, mpd_url):
+    """Lee el manifiesto: representaciones de video/audio y su plantilla de segmentos."""
+    root = ET.fromstring(xml_text)
+    base = mpd_url
+    for el in root:
+        if _tag(el) == "BaseURL" and (el.text or "").strip():
+            base = urljoin(mpd_url, el.text.strip())
+            break
+    info = {"dynamic": root.get("type") == "dynamic", "video": [], "audio": []}
+    for aset in root.iter():
+        if _tag(aset) != "AdaptationSet":
+            continue
+        a_tpl = next((c for c in aset if _tag(c) == "SegmentTemplate"), None)
+        a_kind = (aset.get("contentType") or (aset.get("mimeType") or "").split("/")[0]).lower()
+        for rep in aset:
+            if _tag(rep) != "Representation":
+                continue
+            kind = (a_kind or (rep.get("mimeType") or "").split("/")[0]).lower()
+            if kind not in ("video", "audio"):
+                continue
+            tpl = next((c for c in rep if _tag(c) == "SegmentTemplate"), None) or a_tpl
+            if tpl is None or not tpl.get("media"):
+                continue
+            r = {
+                "id": rep.get("id") or "0",
+                "bw": int(rep.get("bandwidth") or 0),
+                "w": int(rep.get("width") or 0),
+                "h": int(rep.get("height") or 0),
+                "start": int(tpl.get("startNumber") or 1),
+                "timescale": int(tpl.get("timescale") or 1),
+                "media": tpl.get("media"),
+                "base": base,
+                "timeline": [],
+            }
+            init = tpl.get("initialization")
+            r["init"] = urljoin(base, _fill_template(init, r)) if init else None
+            tl = next((c for c in tpl if _tag(c) == "SegmentTimeline"), None)
+            if tl is not None:
+                for s in tl:
+                    if _tag(s) == "S":
+                        r["timeline"].append((
+                            int(s.get("t")) if s.get("t") is not None else None,
+                            int(s.get("d") or 0),
+                            int(s.get("r") or 0),
+                        ))
+            info[kind].append(r)
+    return info
+
+
+def list_segments(rep):
+    """[(número, tiempo, duración)] de los segmentos que el manifiesto lista ahora."""
+    out = []
+    num = rep["start"]
+    t = None
+    for st, d, rr in rep["timeline"]:
+        if st is not None:
+            t = st
+        elif t is None:
+            t = 0
+        for _ in range(rr + 1):
+            out.append((num, t, d))
+            num += 1
+            t += d
+    return out
+
+
+def segment_url(rep, number, time_):
+    return urljoin(rep["base"], _fill_template(rep["media"], rep, number, time_))
+
+
+def http_get(session, url):
+    try:
+        r = session.get(url, timeout=20)
+        return r.status_code, r.content
+    except Exception:
+        return 0, b""
 
 
 def fetch_manifest(url):
@@ -391,6 +529,7 @@ class Instagram:
             "url": url,
             "abr": b.get("dash_abr_playback_url"),
             "title": b.get("broadcast_message") or "",
+            "published": b.get("published_time"),
             "via": via,
         }
 
@@ -558,6 +697,37 @@ class Instagram:
         self.state.save()
         return len(names)
 
+    def fetch_content(self, link, workdir):
+        """Descarga historias, publicaciones, reels y álbumes. Devuelve [{path, type, user}]."""
+        cl = self.cl
+        wd = Path(workdir)
+        wd.mkdir(parents=True, exist_ok=True)
+        out = []
+        kind = link["kind"]
+        if kind == "post":
+            pk = cl.media_pk_from_url(link["url"])
+            info = cl.media_info(pk)
+            user = info.user.username
+            if info.media_type == 1:
+                out.append({"path": str(cl.photo_download(pk, folder=wd)), "type": "foto", "user": user})
+            elif info.media_type == 2:
+                kind_txt = "reel" if "reel" in link["url"] else "video"
+                out.append({"path": str(cl.video_download(pk, folder=wd)), "type": kind_txt, "user": user})
+            elif info.media_type == 8:
+                for p in cl.album_download(pk, folder=wd):
+                    out.append({"path": str(p), "type": "álbum", "user": user})
+        elif kind == "story":
+            spk = cl.story_pk_from_url(link["url"])
+            info = cl.story_info(spk)
+            out.append({"path": str(cl.story_download(spk, folder=wd)), "type": "historia",
+                        "user": info.user.username})
+        elif kind == "stories_user":
+            uid = cl.user_id_from_username(link["user"])
+            for st in cl.user_stories(uid):
+                out.append({"path": str(cl.story_download(st.pk, folder=wd)), "type": "historia",
+                            "user": link["user"]})
+        return out
+
     def refresh_following(self):
         """Cuántas cuentas sigues ahora mismo (None si no se pudo saber)."""
         try:
@@ -607,6 +777,15 @@ class Recording:
         self.dropped = []
         self.upload_failed = False
         self.rc = None
+        self.method = None            # "segmentos" o "ffmpeg"
+        self.dash_note = None
+        self.published = b.get("published")
+        self.live_start = None
+        self.rec_seconds = 0.0
+        self._upl_tasks = []
+        self.finished = False
+        self.status_msg = None
+        self.status_task = None
 
     def failure_text(self, ran):
         reason = self.fail_reason
@@ -621,7 +800,10 @@ class Recording:
             f"⚠️ No pude grabar el live de @{self.user} (estuve {fmt_dur(ran)} intentándolo).",
             f"Motivo: {reason}",
             f"Detectado por: {self.via or '?'}",
+            f"Método: {self.method or 'sin iniciar'}",
         ]
+        if self.dash_note:
+            lines.append("Segmentos: " + self.dash_note)
         if self.probe_err:
             lines.append("ffprobe: " + self.probe_err.strip()[-300:])
         if self.tail:
@@ -649,6 +831,19 @@ class Recording:
         except Exception:
             pass
 
+    def recorded_seconds(self):
+        if self.method == "segmentos":
+            return self.rec_seconds
+        return time.time() - self.t0
+
+    def airtime(self):
+        """Cuánto lleva el live desde que empezó (None si Instagram no dio la hora de inicio)."""
+        if self.published:
+            return max(0.0, time.time() - float(self.published))
+        if self.method == "segmentos":
+            return self.rec_seconds
+        return None
+
     async def run(self):
         os.makedirs(self.dir, exist_ok=True)
         url = self.b["url"]
@@ -662,13 +857,214 @@ class Recording:
             self.fail_reason = "el live ya había terminado (manifiesto estático)"
             shutil.rmtree(self.dir, ignore_errors=True)
             return
+        recorded = False
+        try:
+            recorded = await self._run_dash(url, mpd)
+        except Exception as e:
+            self.dash_note = f"error: {str(e)[:200]}"
+            log.exception("Fallo la grabación por segmentos de @%s", self.user)
+        if not recorded and not self.stop_flag:
+            self.method = "ffmpeg"
+            await self._run_ffmpeg(url)
+        if self._upl_tasks:
+            await asyncio.gather(*self._upl_tasks, return_exceptions=True)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    # ---- método principal: bajar los segmentos numerados (desde el inicio del live) ----
+    async def _run_dash(self, url, mpd_text):
+        info = parse_mpd(mpd_text, url)
+        if not info["video"]:
+            self.dash_note = "el manifiesto no trae video con segmentos"
+            return False
+        vrep = max(info["video"], key=lambda r: (r["w"] * r["h"], r["bw"]))
+        arep = max(info["audio"], key=lambda r: r["bw"]) if info["audio"] else None
+        vsegs = list_segments(vrep)
+        if not vsegs:
+            self.dash_note = "no pude leer la lista de segmentos del manifiesto"
+            return False
+        ts = vrep["timescale"] or 1
+        sess = requests.Session()
+        sess.headers["User-Agent"] = "Mozilla/5.0"
+        segdir = os.path.join(self.dir, "seg")
+        os.makedirs(segdir, exist_ok=True)
+        last_code = {"v": None}
+
+        async def dl(u, path):
+            code, data = await asyncio.to_thread(http_get, sess, u)
+            last_code["v"] = code
+            if code == 200 and data:
+                with open(path, "wb") as f:
+                    f.write(data)
+                return True
+            return False
+
+        vinit = os.path.join(segdir, "v_init")
+        ainit = os.path.join(segdir, "a_init")
+        if not (vrep["init"] and await dl(vrep["init"], vinit)):
+            self.dash_note = f"no pude bajar el encabezado del video (HTTP {last_code['v']})"
+            return False
+        if arep and not (arep["init"] and await dl(arep["init"], ainit)):
+            arep = None   # sin audio
+        a_map = {n: t for n, t, _ in list_segments(arep)} if arep else {}
+
+        done = {}   # número -> {"v": ruta, "a": ruta|None, "dur": segundos}
+
+        async def grab(num, t, dur):
+            vp = os.path.join(segdir, f"v_{num:09d}")
+            if not await dl(segment_url(vrep, num, t), vp):
+                return False
+            ap = None
+            if arep:
+                ap = os.path.join(segdir, f"a_{num:09d}")
+                if not await dl(segment_url(arep, num, a_map.get(num)), ap):
+                    os.remove(vp)
+                    return False
+            done[num] = {"v": vp, "a": ap, "dur": dur}
+            return True
+
+        # 1) hacia atrás: los segmentos anteriores siguen disponibles por número
+        first = vsegs[0][0]
+        typical = vsegs[0][2] / ts
+        can_back = "$Number" in vrep["media"] and (arep is None or "$Number" in arep["media"])
+        if can_back:
+            n, got = first - 1, 0
+            while n >= 0 and got < CFG.backfill_max and not self.stop_flag:
+                batch = list(range(n, max(n - 6, -1), -1))
+                res = await asyncio.gather(*[grab(x, None, typical) for x in batch])
+                got += sum(1 for r in res if r)
+                self.rec_seconds = sum(x["dur"] for x in done.values())
+                if not all(res):
+                    break
+                n = batch[-1] - 1
+        back_secs = sum(x["dur"] for x in done.values())
+        if self.published:
+            self.live_start = datetime.fromtimestamp(float(self.published), CFG.tz)
+        else:
+            self.live_start = self.start - timedelta(seconds=back_secs)
+        if done:
+            self.method = "segmentos"
+
+        # 2) hacia adelante: lo que lista el manifiesto, hasta que el live termine
+        asm_next = min(done) if done else first
+        cum = 0.0
+        cur, dynamic = vsegs, info["dynamic"]
+        fails, misses = {}, 0
+        t_start = last_new = time.time()
+        while True:
+            for num, t, d in cur:
+                if num in done or num < asm_next:
+                    continue
+                if await grab(num, t, d / ts):
+                    self.method = "segmentos"
+                    last_new = time.time()
+                else:
+                    fails[num] = fails.get(num, 0) + 1
+                    if fails[num] >= 6:
+                        done[num] = {"v": None, "a": None, "dur": 0}   # hueco irrecuperable
+                    else:
+                        break
+            self.rec_seconds = sum(x["dur"] for x in done.values()) + cum
+            cum, asm_next = await self._assemble_ready(done, asm_next, cum, vinit, ainit if arep else None, False)
+            if self.method != "segmentos" and time.time() - t_start > 40:
+                self.dash_note = f"no pude bajar segmentos (HTTP {last_code['v']})"
+                return False
+            if self.stop_flag or not dynamic:
+                break
+            if time.time() - last_new > 90:
+                break   # el live dejó de enviar video
+            await asyncio.sleep(2)
+            code, text = await asyncio.to_thread(fetch_manifest, url)
+            if code != 200:
+                misses += 1
+                if misses >= 5:
+                    break
+                continue
+            misses = 0
+            try:
+                info2 = parse_mpd(text, url)
+                nv = next((r for r in info2["video"] if r["id"] == vrep["id"]), None)
+                if nv:
+                    cur, dynamic = list_segments(nv), info2["dynamic"]
+                    if arep:
+                        na = next((r for r in info2["audio"] if r["id"] == arep["id"]), None)
+                        if na:
+                            a_map = {n: t for n, t, _ in list_segments(na)}
+            except Exception:
+                pass
+        await self._assemble_ready(done, asm_next, cum, vinit, ainit if arep else None, True)
+        return self.method == "segmentos"
+
+    async def _assemble_ready(self, done, asm_next, cum, vinit, ainit, final):
+        """Junta los segmentos completos en partes (cada CFG.segment segundos) y las sube."""
+        while True:
+            nums, acc, n = [], 0.0, asm_next
+            while n in done:
+                nums.append(n)
+                acc += done[n]["dur"]
+                n += 1
+                if acc >= CFG.segment:
+                    break
+            if not nums or (acc < CFG.segment and not final):
+                break
+            await self._assemble(nums, done, vinit, ainit, cum)
+            cum += acc
+            asm_next = n
+            for k in nums:
+                done.pop(k, None)
+            if final and n not in done:
+                break
+        return cum, asm_next
+
+    async def _assemble(self, nums, done, vinit, ainit, cum):
+        self.part += 1
+        idx = self.part
+        vcat = os.path.join(self.dir, f"c{idx:03d}_v.mp4")
+        acat = os.path.join(self.dir, f"c{idx:03d}_a.mp4") if ainit else None
+
+        def build():
+            for cat, init, key in ((vcat, vinit, "v"), (acat, ainit, "a")):
+                if not cat:
+                    continue
+                with open(cat, "wb") as out:
+                    with open(init, "rb") as f:
+                        shutil.copyfileobj(f, out)
+                    for n in nums:
+                        p = done[n][key]
+                        if p:
+                            with open(p, "rb") as f:
+                                shutil.copyfileobj(f, out)
+
+        await asyncio.to_thread(build)
+        out = os.path.join(self.dir, f"part_{idx:03d}.mp4")
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", vcat]
+        if acat:
+            cmd += ["-i", acat]
+        cmd += ["-c", "copy", "-movflags", "+faststart", "-avoid_negative_ts", "make_zero", out]
+        rc, _, err = await run_cmd(*cmd)
+        for n in nums:
+            for key in ("v", "a"):
+                p = done[n][key]
+                if p and os.path.exists(p):
+                    os.remove(p)
+        for cat in (vcat, acat):
+            if cat and os.path.exists(cat):
+                os.remove(cat)
+        if rc != 0 or not os.path.exists(out):
+            self.dash_note = "no pude unir video y audio: " + err.decode(errors="ignore")[-200:]
+            log.warning("Fallo al unir la parte %d de @%s: %s", idx, self.user, self.dash_note)
+            return
+        part_start = (self.live_start or self.start) + timedelta(seconds=cum)
+        self._upl_tasks.append(asyncio.create_task(self._upload(out, part_start=part_start, part_no=idx)))
+
+    # ---- método de respaldo: ffmpeg lee el manifiesto directamente ----
+    async def _run_ffmpeg(self, url):
         v, a, self.probe_err = await pick_best_streams(url)
         maps = []
         if v is not None:
             maps += ["-map", f"0:{v}"]
         if a is not None:
             maps += ["-map", f"0:{a}"]
-        log.info("Grabando @%s (video stream %s, audio stream %s)", self.user, v, a)
+        log.info("Grabando @%s con ffmpeg (video stream %s, audio stream %s)", self.user, v, a)
 
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
@@ -699,7 +1095,6 @@ class Recording:
         if self.tail and not glob.glob(os.path.join(self.dir, "part_*.mkv")):
             log.warning("ffmpeg falló para @%s: %s", self.user, " | ".join(self.tail)[-400:])
         await self._upload_ready(final=True)
-        shutil.rmtree(self.dir, ignore_errors=True)
 
     async def _upload_ready(self, final):
         files = sorted(glob.glob(os.path.join(self.dir, "part_*.mkv")))
@@ -707,25 +1102,30 @@ class Recording:
         for f in ready:
             await self._upload(f)
 
-    async def _upload(self, mkv):
-        mp4 = mkv[:-4] + ".mp4"
-        rc, _, err = await run_cmd(
-            "ffmpeg", "-v", "error", "-y", "-i", mkv, "-c", "copy", "-movflags", "+faststart", mp4
-        )
-        if rc != 0 or not os.path.exists(mp4):
-            log.warning("No pude convertir %s: %s", mkv, err[-200:])
-            os.rename(mkv, mkv + ".bad")
-            return
-        os.remove(mkv)
+    async def _upload(self, src, part_start=None, part_no=None):
+        if src.endswith(".mkv"):
+            mp4 = src[:-4] + ".mp4"
+            rc, _, err = await run_cmd(
+                "ffmpeg", "-v", "error", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", mp4
+            )
+            if rc != 0 or not os.path.exists(mp4):
+                log.warning("No pude convertir %s: %s", src, err[-200:])
+                os.rename(src, src + ".bad")
+                return
+            os.remove(src)
+        else:
+            mp4 = src
         dur, w, h = await probe_video(mp4)
         if dur < 3 or os.path.getsize(mp4) < 150_000:
             self.dropped.append(f"{dur:.1f}s, {fmt_size(os.path.getsize(mp4))}")
             os.remove(mp4)
             return
 
-        part_start = self.start + timedelta(seconds=self.cum)
-        self.cum += dur
-        self.part += 1
+        if part_start is None:
+            part_start = self.start + timedelta(seconds=self.cum)
+            self.cum += dur
+            self.part += 1
+            part_no = self.part
 
         # Si por alguna razón pesa más de ~1.9GB, se divide (límite de Telegram: 2GB)
         pieces = [mp4]
@@ -753,7 +1153,7 @@ class Recording:
                 thumb = None
             tag_user = re.sub(r"\W+", "_", self.user)
             tag_date = part_start.strftime("%Y_%m_%d")
-            extra = f" · parte {self.part}" + (f".{i + 1}" if len(pieces) > 1 else "")
+            extra = f" · parte {part_no}" + (f".{i + 1}" if len(pieces) > 1 else "")
             caption = (
                 f"🔴 @{self.user}\n"
                 f"📅 {part_start.strftime('%Y-%m-%d · %H:%M')} ({CFG.tz.key})\n"
@@ -940,11 +1340,121 @@ class App:
             age = f" · actualizado hace {int((time.time() - self.ig.following_time) / 60)} min"
         return f"👥 Siguiendo a: <b>{n}</b> cuentas{age}"
 
+    # ---------- cronómetro de cada grabación ----------
+    def rec_line(self, r):
+        parts = [f"⏱ grabado {fmt_dur(r.recorded_seconds())}"]
+        at = r.airtime()
+        if at:
+            parts.append(f"live {fmt_dur(at)}")
+        return f"@{html.escape(r.user)} – " + " · ".join(parts)
+
+    def rec_status_text(self, rec):
+        icon = "⏹" if rec.finished else "🔴"
+        lines = [f"{icon} @{rec.user}" + (" (terminó)" if rec.finished else " en vivo")]
+        lines.append(f"⏱ Grabado: {fmt_dur(rec.recorded_seconds())}")
+        at = rec.airtime()
+        if at:
+            lines.append(f"📺 El live lleva: {fmt_dur(at)}")
+        lines.append(f"📦 Partes subidas a Telegram: {rec.sent}")
+        lines.append(f"🔎 Detectado por: {rec.via or '?'} · método: {rec.method or 'iniciando…'}")
+        return "\n".join(lines)
+
+    async def _status_loop(self, rec):
+        while not rec.finished:
+            await asyncio.sleep(30)
+            if rec.finished or not rec.status_msg:
+                break
+            try:
+                await rec.status_msg.edit(self.rec_status_text(rec), parse_mode=None)
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    log.debug("No pude actualizar el cronómetro: %s", e)
+
+    # ---------- descargar historias, publicaciones y reels por enlace ----------
+    async def upload_photo(self, user, path, caption):
+        async with self.upload_sem:
+            for attempt in range(1, 4):
+                try:
+                    tid = await self.ensure_topic(user)
+                    await self.client.send_file(
+                        self.chat, path, caption=caption, reply_to=tid, parse_mode=None
+                    )
+                    return True
+                except Exception as e:
+                    log.warning("Subida de foto falló (intento %d): %s", attempt, e)
+                    if "TOPIC" in str(e).upper():
+                        self.state.data["topics"].pop(user, None)
+                    await asyncio.sleep(3 * attempt)
+            return False
+
+    async def deliver_files(self, files):
+        sent = 0
+        for f in files:
+            path, user = f["path"], f["user"].lower()
+            ext = os.path.splitext(path)[1].lower()
+            now = datetime.now(CFG.tz)
+            tag_user = re.sub(r"\W+", "_", user)
+            caption = (
+                f"📥 @{user} · {f['type']}\n"
+                f"📅 {now.strftime('%Y-%m-%d · %H:%M')} ({CFG.tz.key})\n"
+                f"#{tag_user} #{now.strftime('%Y_%m_%d')}"
+            )
+            thumb = None
+            if ext in (".mp4", ".mov", ".mkv", ".webm"):
+                dur, w, h = await probe_video(path)
+                thumb = path + ".jpg"
+                await run_cmd("ffmpeg", "-v", "error", "-y", "-ss", "0.5", "-i", path,
+                              "-frames:v", "1", "-vf", "scale=320:-1", thumb)
+                if not os.path.exists(thumb):
+                    thumb = None
+                ok = await self.upload_video(user, path, caption, dur, w, h, thumb)
+            else:
+                ok = await self.upload_photo(user, path, caption)
+            if ok:
+                sent += 1
+            for p in (path, thumb):
+                if p and os.path.exists(p):
+                    os.remove(p)
+        return sent
+
+    async def handle_link(self, text):
+        """Lo que se hace al recibir un enlace: grabar un live o descargar lo que haya."""
+        link = classify_link(text)
+        kind = link["kind"]
+        if kind == "live":
+            return await self.record_target(text)
+        if kind == "none":
+            return "❌ No entendí el enlace. Envía un enlace de Instagram (live, historia, publicación o reel)."
+        if not self.ig.ok:
+            return "❌ Primero inicia sesión en Instagram (menú → 🔑 Sesión IG)."
+        if kind == "highlight":
+            return "ℹ️ Los destacados todavía no los descargo. Pega el enlace de una historia o una publicación."
+        if kind == "profile":
+            r = await self.record_target(text)       # ¿está en vivo?
+            if r[:1] in ("🔴", "ℹ", "❌"):
+                return r
+            link["kind"] = "stories_user"             # si no, sus historias actuales
+        workdir = os.path.join(CFG.rec_dir, "_descargas", datetime.now().strftime("%H%M%S%f"))
+        try:
+            files = await asyncio.to_thread(self.ig.fetch_content, link, workdir)
+        except Exception as e:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return "❌ No pude descargar: " + html.escape(str(e)[:200])
+        if not files:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return "⚪ No encontré nada que descargar (¿cuenta privada o sin historias activas?)."
+        n = await self.deliver_files(files)
+        shutil.rmtree(workdir, ignore_errors=True)
+        if n == 0:
+            return "❌ Descargué el contenido, pero no pude subirlo a Telegram."
+        return f"✅ Listo: {n} de {len(files)} archivo(s) de @{html.escape(files[0]['user'])} enviados al grupo."
+
     # ---------- diseño: menú con botones ----------
     HELP = (
         "❓ <b>Ayuda</b>\n\n"
         "• <b>Automático:</b> graba solo los lives de las cuentas que sigues.\n"
-        "• <b>Por enlace:</b> pega un enlace de un live (o el @usuario) y lo grabo.\n"
+        "• <b>Por enlace:</b> pega un enlace de Instagram sin ningún comando: live (lo grabo), historia, publicación o reel (lo descargo y lo subo al grupo).\n"
+        "• Mientras graba verás un cronómetro que se actualiza solo, con el tiempo grabado y lo que lleva el live.\n"
         "• <b>Perfiles a grabar:</b> marca tus cuentas favoritas de la lista de las que sigues; el bot las revisa una por una, además de la detección general.\n"
         "• Los videos llegan al grupo, un tema por usuario, con fecha y hora.\n\n"
         "<b>Comandos:</b>\n"
@@ -991,7 +1501,7 @@ class App:
         if self.active:
             lines.append(f"🔴 Grabando ahora ({len(self.active)}):")
             for r in self.active.values():
-                lines.append(f"  • @{html.escape(r.user)} – {fmt_dur(time.time() - r.t0)}")
+                lines.append("  • " + self.rec_line(r))
         else:
             lines.append("⚪ No hay ningún live grabándose ahora.")
         left = max(0, CFG.max_runtime - (time.time() - self.t0))
@@ -1026,15 +1536,18 @@ class App:
             rows = []
             lines = ["🔴 <b>Grabando ahora</b>\n"]
             for bid, r in self.active.items():
-                lines.append(f"• @{html.escape(r.user)} – {fmt_dur(time.time() - r.t0)}")
+                lines.append("• " + self.rec_line(r))
                 rows.append([B(f"⏹ Detener @{r.user}", f"stop:{bid}".encode())])
             return "\n".join(lines), rows + [[B("🔄 Actualizar", b"vivo")], back]
         if key == "grabar":
             self.pending = "grabar"
             return (
-                "🔗 <b>Grabar un live por enlace</b>\n\n"
-                "Envíame ahora el enlace del live de Instagram, o solo el @usuario si está en vivo en este momento.\n\n"
-                "Ejemplos:\n<code>https://www.instagram.com/usuario/live/</code>\n<code>@usuario</code>\n\n"
+                "🔗 <b>Grabar o descargar por enlace</b>\n\n"
+                "Envíame un enlace de Instagram:\n"
+                "• <b>Live</b> → lo grabo (si está en vivo ahora).\n"
+                "• <b>Historia, publicación o reel</b> → lo descargo y lo subo al grupo.\n"
+                "• <b>Perfil</b> → si está en vivo lo grabo; si no, bajo sus historias actuales.\n\n"
+                "Ejemplos:\n<code>https://www.instagram.com/usuario/live/</code>\n<code>https://www.instagram.com/reel/XXXX/</code>\n<code>@usuario</code>\n\n"
                 "También puedes pegar un enlace en cualquier momento, sin abrir este menú."
             ), [back]
         if key.startswith("perfiles"):
@@ -1169,8 +1682,8 @@ class App:
         if pend in ("sessionid", "login") and not event.is_private:
             return
         if pend == "grabar" or (pend is None and LINK_RE.search(text)):
-            msg = await event.reply("⏳ Buscando el live…")
-            await msg.edit(await self.record_target(text), buttons=back)
+            msg = await event.reply("⏳ Trabajando en tu enlace…")
+            await msg.edit(await self.handle_link(text), buttons=back)
         elif pend == "solo":
             d["only"] = self._names(text)
             await asyncio.to_thread(self.state.save)
@@ -1213,8 +1726,8 @@ class App:
         elif cmd == "/grabar":
             if not args:
                 return await reply("Uso: /grabar enlace_del_live  (o /grabar @usuario)")
-            msg = await reply("⏳ Buscando el live…")
-            await msg.edit(await self.record_target(" ".join(args)), buttons=back)
+            msg = await reply("⏳ Trabajando en tu enlace…")
+            await msg.edit(await self.handle_link(" ".join(args)), buttons=back)
         elif cmd == "/login":
             if not event.is_private:
                 return await reply("Por seguridad usa /login solo en chat privado conmigo.")
@@ -1269,12 +1782,27 @@ class App:
 
     async def _run_rec(self, rec):
         try:
+            rec.status_msg = await self.client.send_message(
+                CFG.admin_id, self.rec_status_text(rec), parse_mode=None
+            )
+            rec.status_task = asyncio.create_task(self._status_loop(rec))
+        except Exception as e:
+            log.warning("No pude enviar el cronómetro: %s", e)
+        try:
             await rec.run()
         except Exception as e:
             rec.fail_reason = f"error interno: {str(e)[:200]}"
             log.exception("Error grabando @%s: %s", rec.user, e)
         finally:
+            rec.finished = True
             self.active.pop(rec.id, None)
+            if rec.status_task:
+                rec.status_task.cancel()
+            if rec.status_msg:
+                try:
+                    await rec.status_msg.edit(self.rec_status_text(rec), parse_mode=None)
+                except Exception:
+                    pass
             ran = time.time() - rec.t0
             if ran < 90:
                 self.cooldown[rec.id] = time.time() + 90
@@ -1301,12 +1829,7 @@ class App:
             rec = Recording(self, b)
             self.active[bid] = rec
             rec.task = asyncio.create_task(self._run_rec(rec))
-            if bid not in self.notified:
-                self.notified.add(bid)
-                await self.notify(
-                    f"🔴 @{b['username']} está en vivo (detectado por: {b.get('via') or '?'}). "
-                    "Grabando en máxima calidad…"
-                )
+            self.notified.add(bid)
         for bid, rec in list(self.active.items()):
             if bid in current:
                 continue

@@ -329,6 +329,26 @@ def mask_urls(text):
     return re.sub(r"\?[^\"'<>\s]+", "?…", text)
 
 
+async def probe_manifest(url):
+    """Lo que ffprobe ve en un manifiesto: mejor video y lista de resoluciones."""
+    rc, out, _ = await run_cmd("ffprobe", "-v", "error", "-show_streams", "-of", "json", url, timeout=60)
+    if rc != 0:
+        return None
+    try:
+        vids = [s for s in json.loads(out)["streams"] if s.get("codec_type") == "video"]
+    except Exception:
+        return None
+    if not vids:
+        return None
+    best = max(vids, key=lambda s: (int(s.get("width") or 0) * int(s.get("height") or 0),
+                                    int(s.get("bit_rate") or 0)))
+    return {
+        "w": int(best.get("width") or 0), "h": int(best.get("height") or 0),
+        "bw": int(best.get("bit_rate") or 0),
+        "all": sorted({f"{s.get('width')}x{s.get('height')}" for s in vids}),
+    }
+
+
 async def pick_best_streams(url):
     """Elige el video de mayor resolución/bitrate y el mejor audio del manifiesto."""
     rc, out, probe_stderr = await run_cmd(
@@ -674,6 +694,21 @@ class Instagram:
         detail = f" ({'; '.join(errors)})" if errors else ""
         return None, f"No encontré un live activo{who} en este momento.{detail}"
 
+    def broadcast_urls(self, bid):
+        """Todas las direcciones de manifiesto que Instagram da para un live (ficha completa)."""
+        try:
+            res = self.cl.private_request(f"live/{bid}/info/")
+        except Exception as e:
+            if self._is_login_error(e):
+                raise
+            return []
+        urls = []
+        if isinstance(res, dict):
+            for k, v in res.items():
+                if k.startswith("dash") and k.endswith("url") and isinstance(v, str) and v.startswith("http"):
+                    urls.append(v)
+        return list(dict.fromkeys(urls))
+
     def broadcast_alive(self, bid):
         """True/False si el live sigue activo; None si no se pudo saber."""
         try:
@@ -780,6 +815,11 @@ class Recording:
         self.method = None            # "segmentos" o "ffmpeg"
         self.dash_note = None
         self.published = b.get("published")
+        self.quality = None            # calidad elegida (resolución · bitrate)
+        self.qual_options = []         # resoluciones disponibles en el manifiesto
+        self.manifest_choice = "principal"
+        self.n_manifests = 0
+        self.force_ffmpeg = False
         self.live_start = None
         self.rec_seconds = 0.0
         self._upl_tasks = []
@@ -801,6 +841,7 @@ class Recording:
             f"Motivo: {reason}",
             f"Detectado por: {self.via or '?'}",
             f"Método: {self.method or 'sin iniciar'}",
+            f"Calidad elegida: {self.quality or '?'} (manifiesto {self.manifest_choice})",
         ]
         if self.dash_note:
             lines.append("Segmentos: " + self.dash_note)
@@ -857,18 +898,98 @@ class Recording:
             self.fail_reason = "el live ya había terminado (manifiesto estático)"
             shutil.rmtree(self.dir, ignore_errors=True)
             return
-        recorded = False
-        try:
-            recorded = await self._run_dash(url, mpd)
-        except Exception as e:
-            self.dash_note = f"error: {str(e)[:200]}"
-            log.exception("Fallo la grabación por segmentos de @%s", self.user)
-        if not recorded and not self.stop_flag:
-            self.method = "ffmpeg"
-            await self._run_ffmpeg(url)
+        url, mpd = await self._pick_best_manifest(url, mpd)
+        order = ["ffmpeg", "dash"] if self.force_ffmpeg else ["dash", "ffmpeg"]
+        for m in order:
+            if self.stop_flag:
+                break
+            recorded = False
+            try:
+                if m == "dash":
+                    recorded = await self._run_dash(url, mpd)
+                else:
+                    self.method = "ffmpeg"
+                    await self._run_ffmpeg(url)
+                    recorded = bool(self.sent or self.part or self.dropped)
+            except Exception as e:
+                self.dash_note = f"error ({m}): {str(e)[:200]}"
+                log.exception("Fallo la grabación (%s) de @%s", m, self.user)
+            if recorded:
+                break
         if self._upl_tasks:
             await asyncio.gather(*self._upl_tasks, return_exceptions=True)
         shutil.rmtree(self.dir, ignore_errors=True)
+
+    async def _pick_best_manifest(self, url, mpd):
+        """Prueba todos los manifiestos del live (con mi lector y con ffprobe) y usa el de mejor calidad."""
+        def parse_best(text, u):
+            try:
+                reps = parse_mpd(text, u)["video"]
+            except Exception:
+                return None, []
+            if not reps:
+                return None, []
+            return max(reps, key=lambda r: (r["w"] * r["h"], r["bw"])), reps
+
+        def sc(w, h, bw):
+            return (w * h, bw)
+
+        urls = [url, self.b.get("abr")]
+        ig = getattr(self.app, "ig", None)
+        if ig is not None:
+            try:
+                urls += await asyncio.to_thread(ig.broadcast_urls, self.id)
+            except Exception as e:
+                log.warning("No pude pedir la ficha completa del live: %s", e)
+
+        cands, report, seen = [], [], set()
+        for i, u in enumerate(urls):
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            if u == url:
+                st, text = 200, mpd
+            else:
+                st, text = await asyncio.to_thread(fetch_manifest, u)
+            name = f"manifiesto {len(cands) + 1}"
+            if st != 200 or 'type="static"' in text:
+                report.append(f"{name}: no disponible (HTTP {st})")
+                continue
+            pb, reps = parse_best(text, u)
+            fp = await probe_manifest(u)
+            p_sc = sc(pb["w"], pb["h"], pb["bw"]) if pb else (0, 0)
+            f_sc = sc(fp["w"], fp["h"], fp["bw"]) if fp else (0, 0)
+            line = f"{name}: lector={'%dx%d' % (pb['w'], pb['h']) if pb else 'no pudo leerlo'}"
+            line += f" | ffprobe={', '.join(fp['all']) if fp else 'no pudo leerlo'}"
+            if not pb:
+                line += "\n   inicio: " + mask_urls(text[:500]).replace("\n", " ")
+            report.append(line)
+            cands.append({"url": u, "mpd": text, "pb": pb, "reps": reps, "fp": fp,
+                          "score": max(p_sc, f_sc), "ffmpeg_better": f_sc > p_sc})
+        if cands:
+            top = max(cands, key=lambda c: c["score"])
+            self.n_manifests = len(cands)
+            if top["url"] != url:
+                self.manifest_choice = "otro"
+            url, mpd = top["url"], top["mpd"]
+            self.force_ffmpeg = top["ffmpeg_better"]
+            src = top["fp"] if (top["ffmpeg_better"] and top["fp"]) else (top["pb"] or top["fp"])
+            if src:
+                self.quality = f"{src['w']}x{src['h']} · {src['bw'] / 1e6:.1f} Mbps"
+            opts = set()
+            for r in top["reps"]:
+                opts.add(f"{r['w']}x{r['h']}")
+            if top["fp"]:
+                opts.update(top["fp"]["all"])
+            self.qual_options = sorted(opts)
+        try:
+            await self.app.notify(
+                f"📋 Calidad del live de @{self.user}: elegí {self.quality or '?'}"
+                f"{' (con ffmpeg)' if self.force_ffmpeg else ''}\n" + "\n".join(report)
+            )
+        except Exception:
+            pass
+        return url, mpd
 
     # ---- método principal: bajar los segmentos numerados (desde el inicio del live) ----
     async def _run_dash(self, url, mpd_text):
@@ -1198,6 +1319,7 @@ class App:
         self.unparsed_seen = set()
         self.fail_count = {}
         self.fail_notified = set()
+        self.last_sent = None
         self.client.parse_mode = "html"
 
     # ---------- Telegram ----------
@@ -1258,12 +1380,13 @@ class App:
             for attempt in range(1, 4):
                 try:
                     tid = await self.ensure_topic(user)
-                    await self.client.send_file(
+                    sent = await self.client.send_file(
                         self.chat, path, caption=caption, thumb=thumb, reply_to=tid,
                         attributes=[DocumentAttributeVideo(
                             duration=int(dur), w=w, h=h, supports_streaming=True)],
                         force_document=False, part_size_kb=512, parse_mode=None,
                     )
+                    self.last_sent = sent
                     return True
                 except Exception as e:
                     log.warning("Subida falló (intento %d): %s", attempt, e)
@@ -1355,6 +1478,9 @@ class App:
         at = rec.airtime()
         if at:
             lines.append(f"📺 El live lleva: {fmt_dur(at)}")
+        if rec.quality:
+            opts = ", ".join(rec.qual_options)
+            lines.append(f"🎞 Calidad: {rec.quality} (disponibles: {opts}; manifiestos probados: {rec.n_manifests})")
         lines.append(f"📦 Partes subidas a Telegram: {rec.sent}")
         lines.append(f"🔎 Detectado por: {rec.via or '?'} · método: {rec.method or 'iniciando…'}")
         return "\n".join(lines)
@@ -1376,9 +1502,10 @@ class App:
             for attempt in range(1, 4):
                 try:
                     tid = await self.ensure_topic(user)
-                    await self.client.send_file(
+                    sent = await self.client.send_file(
                         self.chat, path, caption=caption, reply_to=tid, parse_mode=None
                     )
+                    self.last_sent = sent
                     return True
                 except Exception as e:
                     log.warning("Subida de foto falló (intento %d): %s", attempt, e)
@@ -1387,8 +1514,16 @@ class App:
                     await asyncio.sleep(3 * attempt)
             return False
 
+    def message_link(self, user, msg):
+        cid = str(CFG.chat_id)
+        cid = cid[4:] if cid.startswith("-100") else cid.lstrip("-")
+        tid = self.state.data["topics"].get(user)
+        if tid:
+            return f"https://t.me/c/{cid}/{tid}/{msg.id}"
+        return f"https://t.me/c/{cid}/{msg.id}"
+
     async def deliver_files(self, files):
-        sent = 0
+        sent, msgs = 0, []
         for f in files:
             path, user = f["path"], f["user"].lower()
             ext = os.path.splitext(path)[1].lower()
@@ -1412,10 +1547,12 @@ class App:
                 ok = await self.upload_photo(user, path, caption)
             if ok:
                 sent += 1
+                if self.last_sent is not None:
+                    msgs.append((user, self.last_sent))
             for p in (path, thumb):
                 if p and os.path.exists(p):
                     os.remove(p)
-        return sent
+        return sent, msgs
 
     async def handle_link(self, text):
         """Lo que se hace al recibir un enlace: grabar un live o descargar lo que haya."""
@@ -1443,11 +1580,21 @@ class App:
         if not files:
             shutil.rmtree(workdir, ignore_errors=True)
             return "⚪ No encontré nada que descargar (¿cuenta privada o sin historias activas?)."
-        n = await self.deliver_files(files)
+        n, msgs = await self.deliver_files(files)
         shutil.rmtree(workdir, ignore_errors=True)
         if n == 0:
             return "❌ Descargué el contenido, pero no pude subirlo a Telegram."
-        return f"✅ Listo: {n} de {len(files)} archivo(s) de @{html.escape(files[0]['user'])} enviados al grupo."
+        # copia en este chat (reenvío instantáneo, sin volver a subir) y enlace al mensaje del grupo
+        try:
+            await self.client.forward_messages(CFG.admin_id, [m.id for _, m in msgs], from_peer=self.chat)
+        except Exception as e:
+            log.warning("No pude reenviar la copia al chat privado: %s", e)
+        links = " · ".join(
+            f'<a href="{self.message_link(u, m)}">abrir #{i + 1}</a>' for i, (u, m) in enumerate(msgs)
+        )
+        return (f"✅ Listo: {n} de {len(files)} archivo(s) de @{html.escape(files[0]['user'])}.\n"
+                f"Quedó guardado en el grupo (tema @{html.escape(files[0]['user'].lower())}) y te mandé una copia aquí abajo.\n"
+                f"🔗 {links}")
 
     # ---------- diseño: menú con botones ----------
     HELP = (

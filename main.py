@@ -116,6 +116,7 @@ def load_config():
         state_key=_env("STATE_KEY", required=True),       # clave para cifrar la sesión guardada
         ig_proxy=_env("IG_PROXY", ""),                    # opcional: http://user:pass@host:port
         tz=ZoneInfo(_env("TZ_NAME", "America/Lima")),     # tu zona horaria
+        pick_batch=int(_env("PICK_BATCH", "10")),          # perfiles marcados revisados por ronda
         poll=int(_env("POLL_SECONDS", "45")),             # cada cuántos seg. busca lives nuevos
         max_runtime=int(_env("MAX_RUNTIME_MIN", "345")) * 60,  # turno de GitHub (máx 6h)
         segment=int(_env("SEGMENT_SECONDS", "2400")),     # corta partes de 40 min (límite Telegram 2GB)
@@ -175,12 +176,28 @@ async def probe_video(path):
         return 0.0, 0, 0
 
 
+def fetch_manifest(url):
+    """Descarga el manifiesto (.mpd) del live. Devuelve (código HTTP, texto)."""
+    import requests
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        return r.status_code, r.text
+    except Exception as e:
+        return 0, f"error: {e}"
+
+
+def mask_urls(text):
+    """Oculta las firmas de las direcciones para poder compartir el manifiesto."""
+    return re.sub(r"\?[^\"'<>\s]+", "?…", text)
+
+
 async def pick_best_streams(url):
     """Elige el video de mayor resolución/bitrate y el mejor audio del manifiesto."""
-    rc, out, _ = await run_cmd(
+    rc, out, probe_stderr = await run_cmd(
         "ffprobe", "-v", "error", "-show_streams", "-of", "json", url, timeout=90
     )
     v = a = None
+    err = None if rc == 0 else (probe_stderr.decode(errors="ignore")[-400:] or f"ffprobe terminó con código {rc}")
     if rc == 0:
         try:
             streams = json.loads(out)["streams"]
@@ -198,7 +215,7 @@ async def pick_best_streams(url):
                 a = max(auds, key=lambda s: int(s.get("bit_rate") or 0))["index"]
         except Exception:
             pass
-    return v, a
+    return v, a, err
 
 
 # ============================================================================
@@ -218,6 +235,8 @@ class State:
             "only": [],            # si no está vacío: solo se graban estos
             "pks": {},             # usuario -> id numérico (caché)
             "following": None,     # cuántas cuentas sigues (se actualiza solo)
+            "following_names": [], # lista de cuentas que sigues (para elegir perfiles)
+            "picks": [],           # perfiles marcados para revisar uno por uno
         }
         self._load()
 
@@ -272,6 +291,7 @@ class Instagram:
         self.ok = False
         self.user = state.data.get("ig_user")
         self.last_info = None
+        self._pick_idx = 0
         self.following = state.data.get("following")
         self.following_time = None
         self._restore()
@@ -356,11 +376,12 @@ class Instagram:
         )
 
     @staticmethod
-    def _parse_broadcast(b, default_user=None):
+    def _parse_broadcast(b, default_user=None, via=None):
         owner = b.get("broadcast_owner") or b.get("owner") or b.get("user") or {}
         username = owner.get("username") or default_user
-        if b.get("broadcast_status") in ("stopped", "ended", "hard_stop"):
-            return None
+        status = b.get("broadcast_status")
+        if status is not None and status not in ("active", "interrupted"):
+            return None   # terminado, repetición, etc.
         url = b.get("dash_playback_url") or b.get("dash_abr_playback_url") or b.get("playback_url")
         if not (b.get("id") and username and url):
             return None
@@ -370,6 +391,7 @@ class Instagram:
             "url": url,
             "abr": b.get("dash_abr_playback_url"),
             "title": b.get("broadcast_message") or "",
+            "via": via,
         }
 
     @staticmethod
@@ -380,7 +402,7 @@ class Instagram:
     def live_broadcasts(self):
         """Lista de lives de las cuentas que sigues (bandeja general de Instagram)."""
         found = {}
-        info = {"time": time.time(), "endpoints": {}, "total": 0, "unparsed": []}
+        info = {"time": time.time(), "endpoints": {}, "total": 0, "unparsed": [], "picks": []}
         tray_ok = False
         try:
             res = self._fetch_tray("tray_get")
@@ -392,7 +414,7 @@ class Instagram:
                         raw.append(item["broadcast"])
                 n_ok = 0
                 for b in raw:
-                    parsed = self._parse_broadcast(b)
+                    parsed = self._parse_broadcast(b, via="bandeja")
                     if parsed:
                         found[parsed["id"]] = parsed
                         n_ok += 1
@@ -408,9 +430,41 @@ class Instagram:
                 raise
             info["endpoints"]["bandeja"] = "error: " + str(e)[:150]
 
+        # Perfiles marcados: se revisan uno por uno (más rápido y seguro), en rotación
+        picks = list(self.state.data.get("picks", []))
+        picks_ok = False
+        if picks:
+            batch = []
+            for _ in range(min(CFG.pick_batch, len(picks))):
+                batch.append(picks[self._pick_idx % len(picks)])
+                self._pick_idx += 1
+            for u in dict.fromkeys(batch):
+                try:
+                    pk = self.state.data["pks"].get(u)
+                    if not pk:
+                        pk = str(self.cl.user_id_from_username(u))
+                        self.state.data["pks"][u] = pk
+                    res = self.cl.private_request(f"feed/user/{pk}/story/")
+                    picks_ok = True
+                    b = (res or {}).get("broadcast")
+                    if b:
+                        parsed = self._parse_broadcast(b, default_user=u, via="perfil")
+                        if parsed:
+                            found[parsed["id"]] = parsed
+                            info["picks"].append(f"{u}: EN VIVO")
+                        else:
+                            info["picks"].append(f"{u}: live sin url")
+                            info["unparsed"].append(self._describe(b))
+                    else:
+                        info["picks"].append(f"{u}: no esta en vivo")
+                except Exception as e:
+                    if self._is_login_error(e):
+                        raise
+                    info["picks"].append(f"{u}: error {str(e)[:70]}")
+
         info["total"] = len(found)
         self.last_info = info
-        if not tray_ok:
+        if not tray_ok and not picks_ok:
             raise RuntimeError("No pude leer Instagram: " + " | ".join(info["endpoints"].values())[:300])
         return list(found.values())
 
@@ -431,7 +485,7 @@ class Instagram:
                 if isinstance(item, dict) and item.get("broadcast"):
                     raw.append(item["broadcast"])
             for b in raw:
-                p = self._parse_broadcast(b)
+                p = self._parse_broadcast(b, via="bandeja")
                 if p:
                     out.append(p)
         return out
@@ -443,7 +497,7 @@ class Instagram:
         if broadcast_id:
             try:
                 res = cl.private_request(f"live/{broadcast_id}/info/")
-                b = self._parse_broadcast(res, default_user=username)
+                b = self._parse_broadcast(res, default_user=username, via="id")
                 if b:
                     return b, "ok"
                 if isinstance(res, dict) and res.get("broadcast_status") not in (None, "active", "interrupted"):
@@ -470,7 +524,7 @@ class Instagram:
                 res = cl.private_request(f"feed/user/{pk}/story/")
                 b = (res or {}).get("broadcast")
                 if b:
-                    p = self._parse_broadcast(b, default_user=username)
+                    p = self._parse_broadcast(b, default_user=username, via="perfil")
                     if p:
                         return p, "ok"
             except Exception as e:
@@ -491,6 +545,18 @@ class Instagram:
             return None
         return res["broadcast_status"] in ("active", "interrupted")
 
+
+    def fetch_following_list(self):
+        """Descarga la lista de cuentas que sigues (para elegir cuáles marcar)."""
+        users = self.cl.user_following(self.cl.user_id, use_cache=False)
+        names = {}
+        for pk, u in users.items():
+            if getattr(u, "username", None):
+                names[u.username.lower()] = str(pk)
+        self.state.data["pks"].update(names)
+        self.state.data["following_names"] = sorted(names)
+        self.state.save()
+        return len(names)
 
     def refresh_following(self):
         """Cuántas cuentas sigues ahora mismo (None si no se pudo saber)."""
@@ -534,6 +600,36 @@ class Recording:
         self.task = None
         self.t0 = time.time()
         self.tail = deque(maxlen=15)
+        self.via = b.get("via")
+        self.fail_reason = None
+        self.probe_err = None
+        self.mpd_head = ""
+        self.dropped = []
+        self.upload_failed = False
+        self.rc = None
+
+    def failure_text(self, ran):
+        reason = self.fail_reason
+        if not reason:
+            if self.upload_failed:
+                reason = "no se pudo subir el video a Telegram"
+            elif self.dropped:
+                reason = "el video quedó demasiado corto (" + ", ".join(self.dropped) + ")"
+            else:
+                reason = f"ffmpeg terminó sin producir video (código {self.rc})"
+        lines = [
+            f"⚠️ No pude grabar el live de @{self.user} (estuve {fmt_dur(ran)} intentándolo).",
+            f"Motivo: {reason}",
+            f"Detectado por: {self.via or '?'}",
+        ]
+        if self.probe_err:
+            lines.append("ffprobe: " + self.probe_err.strip()[-300:])
+        if self.tail:
+            lines.append("ffmpeg: " + " | ".join(self.tail)[-500:])
+        if self.mpd_head:
+            lines.append("Manifiesto (recortado):\n" + self.mpd_head)
+        lines.append("Mándale este mensaje a Claude para arreglarlo.")
+        return "\n".join(lines)[:3800]
 
     def request_stop(self):
         self.stop_flag = True
@@ -556,7 +652,17 @@ class Recording:
     async def run(self):
         os.makedirs(self.dir, exist_ok=True)
         url = self.b["url"]
-        v, a = await pick_best_streams(url)
+        status, mpd = await asyncio.to_thread(fetch_manifest, url)
+        self.mpd_head = mask_urls(mpd[:1800])
+        if status != 200:
+            self.fail_reason = f"el manifiesto del live respondió {status}"
+            shutil.rmtree(self.dir, ignore_errors=True)
+            return
+        if 'type="static"' in mpd:
+            self.fail_reason = "el live ya había terminado (manifiesto estático)"
+            shutil.rmtree(self.dir, ignore_errors=True)
+            return
+        v, a, self.probe_err = await pick_best_streams(url)
         maps = []
         if v is not None:
             maps += ["-map", f"0:{v}"]
@@ -589,6 +695,7 @@ class Recording:
                 if time.time() - stop_since > 45 and self.proc.returncode is None:
                     self.proc.terminate()
         await err_task
+        self.rc = self.proc.returncode
         if self.tail and not glob.glob(os.path.join(self.dir, "part_*.mkv")):
             log.warning("ffmpeg falló para @%s: %s", self.user, " | ".join(self.tail)[-400:])
         await self._upload_ready(final=True)
@@ -612,6 +719,7 @@ class Recording:
         os.remove(mkv)
         dur, w, h = await probe_video(mp4)
         if dur < 3 or os.path.getsize(mp4) < 150_000:
+            self.dropped.append(f"{dur:.1f}s, {fmt_size(os.path.getsize(mp4))}")
             os.remove(mp4)
             return
 
@@ -659,6 +767,7 @@ class Recording:
                 if thumb:
                     os.remove(thumb)
             else:
+                self.upload_failed = True
                 os.makedirs(os.path.join(CFG.rec_dir, "_fallidos"), exist_ok=True)
                 shutil.move(p, os.path.join(CFG.rec_dir, "_fallidos", os.path.basename(p)))
                 await self.app.notify(f"⚠️ No pude subir una parte del live de @{self.user}.")
@@ -687,6 +796,8 @@ class App:
         self.session_alert_sent = False
         self.pending = None       # lo que espera el menú (enlace, usuarios…)
         self.unparsed_seen = set()
+        self.fail_count = {}
+        self.fail_notified = set()
         self.client.parse_mode = "html"
 
     # ---------- Telegram ----------
@@ -785,11 +896,19 @@ class App:
             return "⚪ " + html.escape(note) + "\nLos lives de las cuentas que sigues se graban solos cuando empiezan."
         if b["id"] in self.active:
             return "ℹ️ Ese live ya se está grabando."
+        status, mpd = await asyncio.to_thread(fetch_manifest, b["url"])
+        if status != 200:
+            return (f"⚪ Encontré el live de @{html.escape(b['username'])}, pero su video ya no responde "
+                    f"(código {status}). Probablemente ya terminó.")
+        if 'type="static"' in mpd:
+            return f"⚪ El live de @{html.escape(b['username'])} ya terminó, no se puede grabar en directo."
         rec = Recording(self, b, manual=True)
         self.active[b["id"]] = rec
         rec.task = asyncio.create_task(self._run_rec(rec))
         self.notified.add(b["id"])
-        return f"🔴 Grabando el live de @{html.escape(b['username'])} en máxima calidad…"
+        return (f"🔴 Grabando el live de @{html.escape(b['username'])} en máxima calidad…\n"
+                f"(encontrado por: {html.escape(str(b.get('via') or '?'))})\n"
+                "El video llega al grupo cuando termine el live. Si algo falla, te aviso aquí.")
 
     # ---------- conteo de cuentas que sigues (automático) ----------
     async def refresh_following(self, force=False):
@@ -826,6 +945,7 @@ class App:
         "❓ <b>Ayuda</b>\n\n"
         "• <b>Automático:</b> graba solo los lives de las cuentas que sigues.\n"
         "• <b>Por enlace:</b> pega un enlace de un live (o el @usuario) y lo grabo.\n"
+        "• <b>Perfiles a grabar:</b> marca tus cuentas favoritas de la lista de las que sigues; el bot las revisa una por una, además de la detección general.\n"
         "• Los videos llegan al grupo, un tema por usuario, con fecha y hora.\n\n"
         "<b>Comandos:</b>\n"
         "/menu · /estado · /siguiendo · /diag · /grabar enlace\n"
@@ -849,6 +969,7 @@ class App:
             f"👤 Instagram: {ig}\n"
             f"{self.following_line()}\n"
             f"🔴 Grabando ahora: {len(self.active)}\n"
+            f"📋 Perfiles marcados: {len(d['picks'])}\n"
             f"🎯 Modo: {modo}\n"
             f"⏱ Consulta cada {CFG.poll} segundos\n"
             f"⏳ Turno actual termina en {fmt_dur(left)}\n\n"
@@ -860,7 +981,7 @@ class App:
         return [
             [B("📊 Estado", b"estado"), B("🔴 En vivo ahora", b"vivo")],
             [B("🔗 Grabar enlace", b"grabar"), B("🔑 Sesión IG", b"sesion")],
-            [B("🎯 Solo cuentas", b"solo"), B("🩺 Diagnóstico", b"diag")],
+            [B("📋 Perfiles a grabar", b"perfiles"), B("🩺 Diagnóstico", b"diag")],
             [B("❓ Ayuda", b"ayuda")],
         ]
 
@@ -884,6 +1005,7 @@ class App:
         lines = [f"🩺 <b>Diagnóstico</b>\n\nÚltima consulta hace {int(time.time() - i['time'])} s · "
                  f"sesión: {'OK' if self.ig.ok else 'caída'}"]
         lines += [f"• {html.escape(k)}: {html.escape(str(v))}" for k, v in i["endpoints"].items()]
+        lines += [f"• perfil {html.escape(w)}" for w in i.get("picks", [])]
         lines.append(f"Lives detectados: {i['total']}")
         return "\n".join(lines)
 
@@ -915,6 +1037,44 @@ class App:
                 "Ejemplos:\n<code>https://www.instagram.com/usuario/live/</code>\n<code>@usuario</code>\n\n"
                 "También puedes pegar un enlace en cualquier momento, sin abrir este menú."
             ), [back]
+        if key.startswith("perfiles"):
+            if not self.ig.ok:
+                return "❌ Primero inicia sesión en Instagram (🔑 Sesión IG).", [back]
+            names = d.get("following_names") or []
+            if not names:
+                try:
+                    await asyncio.to_thread(self.ig.fetch_following_list)
+                except Exception as e:
+                    return "❌ No pude leer la lista de cuentas que sigues: " + html.escape(str(e)[:200]), [back]
+                names = d.get("following_names") or []
+            if not names:
+                return "⚪ No encontré cuentas en tu lista de seguidos.", [back]
+            PAGE = 8
+            pages = max(1, math.ceil(len(names) / PAGE))
+            try:
+                page = int(key.split(":")[1]) if ":" in key else 0
+            except ValueError:
+                page = 0
+            page = min(max(page, 0), pages - 1)
+            picks = set(d["picks"])
+            rows = [
+                [B(("✅ " if u in picks else "⬜ ") + "@" + u, f"pick:{u}:{page}".encode())]
+                for u in names[page * PAGE:(page + 1) * PAGE]
+            ]
+            nav = []
+            if page > 0:
+                nav.append(B("◀️", f"perfiles:{page - 1}".encode()))
+            nav.append(B(f"{page + 1}/{pages}", b"noop"))
+            if page < pages - 1:
+                nav.append(B("▶️", f"perfiles:{page + 1}".encode()))
+            rows.append(nav)
+            rows.append([B("🔄 Recargar lista", b"perfiles_reload"), back[0]])
+            return (
+                "📋 <b>Perfiles a grabar</b>\n\n"
+                "Toca una cuenta para marcarla ✅. Las marcadas se revisan una por una en cada ronda. "
+                "Las demás que sigues también se graban por la detección general.\n\n"
+                f"Marcadas: {len(picks)} · Sigues a {len(names)}"
+            ), rows
         if key == "solo":
             self.pending = "solo"
             lst = ", ".join("@" + html.escape(w) for w in d["only"]) or "todas las que sigues"
@@ -955,6 +1115,20 @@ class App:
         except Exception:
             pass
         self.pending = None
+        if data == "noop":
+            return
+        if data.startswith("pick:"):
+            _, u, pg = data.split(":", 2)
+            picks = self.state.data.setdefault("picks", [])
+            if u in picks:
+                picks.remove(u)
+            else:
+                picks.append(u)
+            await asyncio.to_thread(self.state.save)
+            data = f"perfiles:{pg}"
+        elif data == "perfiles_reload":
+            self.state.data["following_names"] = []
+            data = "perfiles:0"
         if data.startswith("stop:"):
             rec = self.active.get(data[5:])
             if rec:
@@ -1097,13 +1271,20 @@ class App:
         try:
             await rec.run()
         except Exception as e:
+            rec.fail_reason = f"error interno: {str(e)[:200]}"
             log.exception("Error grabando @%s: %s", rec.user, e)
         finally:
             self.active.pop(rec.id, None)
-            if time.time() - rec.t0 < 90:
+            ran = time.time() - rec.t0
+            if ran < 90:
                 self.cooldown[rec.id] = time.time() + 90
             if rec.sent:
                 await self.notify(f"✅ Live de @{rec.user} guardado en Telegram ({rec.sent} parte/s).")
+            else:
+                self.fail_count[rec.id] = self.fail_count.get(rec.id, 0) + 1
+                if rec.id not in self.fail_notified:
+                    self.fail_notified.add(rec.id)
+                    await self.notify(rec.failure_text(ran))
 
     async def handle_lives(self, lives):
         now = time.time()
@@ -1115,12 +1296,17 @@ class App:
                 continue
             if not self.allowed(b["username"]) or self.cooldown.get(bid, 0) > now:
                 continue
+            if self.fail_count.get(bid, 0) >= 3:
+                continue   # falló 3 veces: no insisto con este live
             rec = Recording(self, b)
             self.active[bid] = rec
             rec.task = asyncio.create_task(self._run_rec(rec))
             if bid not in self.notified:
                 self.notified.add(bid)
-                await self.notify(f"🔴 @{b['username']} está en vivo. Grabando en máxima calidad…")
+                await self.notify(
+                    f"🔴 @{b['username']} está en vivo (detectado por: {b.get('via') or '?'}). "
+                    "Grabando en máxima calidad…"
+                )
         for bid, rec in list(self.active.items()):
             if bid in current:
                 continue

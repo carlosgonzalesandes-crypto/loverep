@@ -391,7 +391,9 @@ class State:
             "ig_user": None,
             "tg_session": "",      # sesión del bot de Telegram
             "topics": {},          # (en desuso)
-            "library": {},         # usuario -> videos guardados en este chat (id, fecha, duración, peso)
+            "library": {},         # biblioteca completa del administrador
+            "user_library": {},     # chat_id -> videos que ese usuario puede ver
+            "authorized_users": [], # usuarios que ingresaron la contraseña del bot
             "only": [],            # si no está vacío: solo se graban estos
             "pks": {},             # usuario -> id numérico (caché)
             "following": None,     # cuántas cuentas sigues (se actualiza solo)
@@ -802,9 +804,11 @@ class Instagram:
 # GRABACIÓN DE UN LIVE  (ffmpeg, calidad máxima, sin recomprimir)
 # ============================================================================
 class Recording:
-    def __init__(self, app, b, manual=False):
+    def __init__(self, app, b, manual=False, owner_id=None):
         self.app = app
         self.b = b
+        self.owner_id = int(owner_id or CFG.admin_id)
+        self.recipient_ids = {self.owner_id}
         self.manual = manual
         self.user = b["username"]
         self.id = b["id"]
@@ -1307,7 +1311,7 @@ class Recording:
             try:
                 meta = {"kind": "live", "when": part_start.isoformat(), "size": os.path.getsize(p),
                         "part": (f"{part_no}.{i + 1}" if len(pieces) > 1 else part_no)}
-                ok = await self.app.upload_video(self.user, p, caption, d, pw, ph, thumb, meta)
+                ok = await self.app.upload_video(self.user, p, caption, d, pw, ph, thumb, meta, self.recipient_ids)
             finally:
                 self.uploading -= 1
             if ok:
@@ -1343,7 +1347,8 @@ class App:
         self.upload_sem = asyncio.Semaphore(2)
         self.use_topics = False    # todo llega al chat privado con el bot
         self.session_alert_sent = False
-        self.pending = None       # lo que espera el menú (enlace, usuarios…)
+        self.pending = None       # lo que espera el menú del administrador
+        self.pending_by_user = {}
         self.unparsed_seen = set()
         self.fail_count = {}
         self.fail_notified = set()
@@ -1357,6 +1362,32 @@ class App:
             await self.client.send_message(CFG.admin_id, text, parse_mode=None)
         except Exception as e:
             log.warning("No pude avisar al admin: %s", e)
+
+    def is_admin(self, user_id):
+        return int(user_id or 0) == int(CFG.admin_id)
+
+    def is_authorized(self, user_id):
+        return self.is_admin(user_id) or int(user_id or 0) in {
+            int(x) for x in self.state.data.get("authorized_users", [])
+        }
+
+    def user_menu_text(self):
+        return ("🎥 <b>Grabador de lives</b>\n\n"
+                "Puedes enviar un enlace de un live o el @usuario de Instagram para grabarlo.\n"
+                "En 📚 Mis videos verás únicamente tus grabaciones.")
+
+    def user_menu_buttons(self):
+        return [[Button.inline("🔴 Grabar live", b"grabar")],
+                [Button.inline("📚 Mis videos", b"lib")],
+                [Button.inline("📡 Mi grabación", b"vivo")]]
+
+    async def send_user_notice(self, user_id, text):
+        if self.is_admin(user_id):
+            return
+        try:
+            await self.client.send_message(int(user_id), text, parse_mode=None)
+        except Exception as e:
+            log.warning("No pude avisar al usuario %s: %s", user_id, e)
 
     async def resolve_chat(self):
         try:
@@ -1404,20 +1435,28 @@ class App:
                 )
                 return None
 
-    async def upload_video(self, user, path, caption, dur, w, h, thumb, meta=None):
+    async def upload_video(self, user, path, caption, dur, w, h, thumb, meta=None, recipient_ids=None):
         async with self.upload_sem:
             for attempt in range(1, 4):
                 try:
                     tid = await self.ensure_topic(user)
                     sent = await self.client.send_file(
-                        self.chat, path, caption=caption, thumb=thumb, reply_to=tid,
+                        CFG.admin_id, path, caption=caption, thumb=thumb, reply_to=tid,
                         attributes=[DocumentAttributeVideo(
                             duration=int(dur), w=w, h=h, supports_streaming=True)],
                         force_document=False, part_size_kb=512, parse_mode=None,
                     )
                     self.last_sent = sent
+                    recipients = {int(x) for x in (recipient_ids or {CFG.admin_id})}
+                    recipients.discard(int(CFG.admin_id))
                     if meta:
-                        await self.library_add(user, sent, dur, meta)
+                        await self.library_add(user, sent, dur, meta, recipients)
+                    for recipient in recipients:
+                        try:
+                            await self.client.forward_messages(recipient, [sent.id], from_peer=CFG.admin_id)
+                        except Exception as e:
+                            log.warning("No pude entregar el video al usuario %s: %s", recipient, e)
+                            await self.send_user_notice(recipient, "⚠️ La grabación terminó, pero no pude entregarte el video. El administrador fue avisado.")
                     return True
                 except Exception as e:
                     log.warning("Subida falló (intento %d): %s", attempt, e)
@@ -1431,30 +1470,42 @@ class App:
         return (not d["only"]) or (u in d["only"])
 
     # ---------- enlaces / búsqueda manual ----------
-    async def record_target(self, text):
+    async def record_target(self, text, owner_id=None):
         """Graba un live a partir de un enlace de Instagram, @usuario o id. Devuelve el texto de respuesta."""
         if not self.ig.ok:
-            return "❌ Primero inicia sesión en Instagram (menú → 🔑 Sesión IG)."
+            if self.is_admin(owner_id or CFG.admin_id):
+                return "❌ Primero inicia sesión en Instagram (menú → 🔑 Sesión IG)."
+            return "⚠️ El grabador no está disponible en este momento. El administrador debe revisar la conexión."
         user, bid = parse_target(text)
         if not user and not bid:
             return "❌ No entendí el enlace. Envía un enlace de Instagram o el @usuario."
         if bid and bid in self.active:
-            return "ℹ️ Ese live ya se está grabando."
+            self.active[bid].recipient_ids.add(int(owner_id or CFG.admin_id))
+            return "ℹ️ Ese live ya se está grabando. Te enviaré el video cuando termine."
         try:
             b, note = await asyncio.to_thread(self.ig.find_live, user, bid)
         except Exception as e:
-            return "❌ Error consultando Instagram: " + html.escape(str(e)[:200])
+            log.exception("Error consultando live solicitado por %s", owner_id)
+            await self.notify(f"⚠️ Error consultando Instagram para una solicitud de grabación: {str(e)[:500]}")
+            if self.is_admin(owner_id or CFG.admin_id):
+                return "❌ Error consultando Instagram: " + html.escape(str(e)[:200])
+            return "⚠️ No pude consultar Instagram en este momento. El administrador recibió el aviso."
         if not b:
+            if not self.is_admin(owner_id or CFG.admin_id):
+                return "⚪ No encontré un live activo para esa cuenta. Comprueba el @usuario o inténtalo cuando esté en directo."
             return "⚪ " + html.escape(note) + "\nLos lives de las cuentas que sigues se graban solos cuando empiezan."
         if b["id"] in self.active:
-            return "ℹ️ Ese live ya se está grabando."
+            self.active[b["id"]].recipient_ids.add(int(owner_id or CFG.admin_id))
+            return "ℹ️ Ese live ya se está grabando. Te enviaré el video cuando termine."
         status, mpd = await asyncio.to_thread(fetch_manifest, b["url"])
         if status != 200:
+            if not self.is_admin(owner_id or CFG.admin_id):
+                return f"⚪ El live de @{html.escape(b['username'])} ya no está disponible para grabar."
             return (f"⚪ Encontré el live de @{html.escape(b['username'])}, pero su video ya no responde "
                     f"(código {status}). Probablemente ya terminó.")
         if 'type="static"' in mpd:
             return f"⚪ El live de @{html.escape(b['username'])} ya terminó, no se puede grabar en directo."
-        rec = Recording(self, b, manual=True)
+        rec = Recording(self, b, manual=True, owner_id=owner_id or CFG.admin_id)
         self.active[b["id"]] = rec
         rec.task = asyncio.create_task(self._run_rec(rec))
         self.notified.add(b["id"])
@@ -1522,6 +1573,11 @@ class App:
                 break
             try:
                 await rec.status_msg.edit(self.rec_status_text(rec), parse_mode=None)
+                for user_msg in getattr(rec, "user_status_msgs", []):
+                    try:
+                        await user_msg.edit(f"🔴 Grabando @{rec.user}\n⏱ Tiempo: {fmt_dur(rec.recorded_seconds())}\nTe enviaré el video al terminar.", parse_mode=None)
+                    except Exception:
+                        pass
             except Exception as e:
                 if "not modified" not in str(e).lower():
                     log.debug("No pude actualizar el cronómetro: %s", e)
@@ -1632,13 +1688,37 @@ class App:
         except Exception:
             return "?"
 
-    async def library_add(self, user, sent, dur, meta):
+    async def library_add(self, user, sent, dur, meta, recipient_ids=None):
+        item = {
+            "id": sent.id, "user": user.lower(), "when": meta.get("when"),
+            "kind": meta.get("kind", "live"), "dur": int(dur or 0),
+            "size": int(meta.get("size") or 0), "part": meta.get("part"),
+        }
         lib = self.state.data.setdefault("library", {})
-        lib.setdefault(user.lower(), []).append({
-            "id": sent.id, "when": meta.get("when"), "kind": meta.get("kind", "live"),
-            "dur": int(dur or 0), "size": int(meta.get("size") or 0), "part": meta.get("part"),
-        })
+        lib.setdefault(user.lower(), []).append(dict(item))
+        user_lib = self.state.data.setdefault("user_library", {})
+        for recipient in (recipient_ids or set()):
+            user_lib.setdefault(str(int(recipient)), []).append(dict(item))
         await asyncio.to_thread(self.state.save)
+
+    def user_library_screen(self, user_id, page=0):
+        B = Button.inline
+        items = list(reversed(self.state.data.get("user_library", {}).get(str(int(user_id)), [])))
+        if not items:
+            return "📚 <b>Mis videos</b>\n\nTodavía no tienes grabaciones.", [[B("⬅️ Menú", b"menu")]]
+        page_size = 6
+        pages = max(1, math.ceil(len(items) / page_size))
+        page = min(max(int(page), 0), pages - 1)
+        rows = []
+        for item in items[page * page_size:(page + 1) * page_size]:
+            label = f"🔴 @{item.get('user','live')} · {self._when(item.get('when'))} · {fmt_dur(item.get('dur', 0))}"
+            rows.append([B(label, f"play:{item['id']}".encode())])
+        nav = []
+        if page: nav.append(B("◀️", f"userlib:{page-1}".encode()))
+        nav.append(B(f"{page+1}/{pages}", b"noop"))
+        if page < pages - 1: nav.append(B("▶️", f"userlib:{page+1}".encode()))
+        rows += [nav, [B("⬅️ Menú", b"menu")]]
+        return f"📚 <b>Mis videos</b>\n{len(items)} grabación(es). Solo tú puedes ver esta lista.", rows
 
     def account_menu(self, user):
         n = len(self.state.data.get("library", {}).get(user, []))
@@ -1785,8 +1865,27 @@ class App:
         d = self.state.data
         back = self._back()
         if key == "menu":
+            if not self.is_admin(event.sender_id):
+                return self.user_menu_text(), self.user_menu_buttons()
             await self.refresh_following()
             return self.menu_text(), self.menu_buttons()
+        if not self.is_admin(event.sender_id):
+            if key == "grabar":
+                return ("🔴 <b>Grabar un live</b>\n\nEnvíame el enlace del live de Instagram o el @usuario de la cuenta.\n"
+                        "Solo recibirás tus propias grabaciones."), [back]
+            if key == "lib":
+                return self.user_library_screen(event.sender_id, 0)
+            if key.startswith("userlib:"):
+                return self.user_library_screen(event.sender_id, int(key.split(":", 1)[1]))
+            if key == "vivo":
+                mine = [r for r in self.active.values() if int(event.sender_id) in r.recipient_ids]
+                if not mine:
+                    return "⚪ No tienes una grabación activa.", [[B("🔄 Actualizar", b"vivo")], back]
+                lines = ["🔴 <b>Tus grabaciones activas</b>"]
+                for rec in mine:
+                    lines.append(f"• @{html.escape(rec.user)} · {fmt_dur(rec.recorded_seconds())}")
+                return "\n".join(lines), [[B("🔄 Actualizar", b"vivo")], back]
+            return self.user_menu_text(), self.user_menu_buttons()
         if key == "estado":
             await self.refresh_following()
             return self.estado_text(), [[B("🔄 Actualizar", b"estado")], back]
@@ -1915,9 +2014,30 @@ class App:
             await event.answer()
         except Exception:
             pass
+        uid = int(event.sender_id)
+        if not self.is_admin(uid) and not event.is_private:
+            return
+        if not self.is_authorized(uid):
+            try: await event.answer("Primero escribe /start y la contraseña.", alert=True)
+            except Exception: pass
+            return
         self.pending = None
         if data == "noop":
             return
+        if not self.is_admin(uid):
+            if data.startswith("play:"):
+                mid = int(data[5:])
+                own = self.state.data.get("user_library", {}).get(str(uid), [])
+                if not any(int(x.get("id", -1)) == mid for x in own):
+                    return
+                try:
+                    await self.client.forward_messages(uid, [mid], from_peer=CFG.admin_id)
+                except Exception as e:
+                    log.warning("No pude reenviar video al usuario %s: %s", uid, e)
+                    await self.send_user_notice(uid, "⚠️ No pude abrir ese video. El administrador fue avisado.")
+                return
+            if data not in ("menu", "grabar", "lib", "vivo") and not data.startswith("userlib:"):
+                return
         if data.startswith("play:"):
             mid = int(data[5:])
             try:
@@ -1973,6 +2093,40 @@ class App:
         text = (event.raw_text or "").strip()
         if not text:
             return
+        uid = int(event.sender_id)
+        if not self.is_admin(uid) and not event.is_private:
+            return
+        if not self.is_authorized(uid):
+            if text.split()[0].split("@")[0].lower() == "/start":
+                return await event.reply("🔐 Para usar el grabador, envía la contraseña de acceso.")
+            if text == "1224":
+                await self._try_delete(event)
+                users = self.state.data.setdefault("authorized_users", [])
+                if uid not in [int(x) for x in users]:
+                    users.append(uid)
+                    await asyncio.to_thread(self.state.save)
+                await event.reply("✅ Acceso autorizado.\n\n" + self.user_menu_text(), buttons=self.user_menu_buttons())
+                return
+            return await event.reply("🔐 Acceso restringido. Escribe /start para ingresar la contraseña.")
+        if not self.is_admin(uid):
+            if text.startswith("/"):
+                cmd = text.split()[0].split("@")[0].lower()
+                if cmd in ("/start", "/menu"):
+                    return await event.reply(self.user_menu_text(), buttons=self.user_menu_buttons())
+                if cmd == "/grabar":
+                    args = text.split(maxsplit=1)
+                    if len(args) < 2:
+                        return await event.reply("Envíame /grabar seguido del enlace del live o @usuario.")
+                    msg = await event.reply("⏳ Buscando el live…")
+                    out = await self.record_target(args[1], owner_id=uid)
+                    return await msg.edit(out)
+                return await event.reply("Solo puedes grabar lives y ver tus propios videos. Usa /menu.", buttons=self.user_menu_buttons())
+            user, bid = parse_target(text)
+            if user or bid:
+                msg = await event.reply("⏳ Buscando el live…")
+                out = await self.record_target(text, owner_id=uid)
+                return await msg.edit(out)
+            return await event.reply("Envíame un enlace de un live de Instagram o un @usuario para grabarlo.")
         if text.startswith("/"):
             return await self.on_command(event, text)
         pend, self.pending = self.pending, None
@@ -2086,6 +2240,15 @@ class App:
             rec.status_msg = await self.client.send_message(
                 CFG.admin_id, self.rec_status_text(rec), parse_mode=None
             )
+            rec.user_status_msgs = []
+            for recipient in rec.recipient_ids:
+                if not self.is_admin(recipient):
+                    try:
+                        rec.user_status_msgs.append(await self.client.send_message(
+                            recipient, f"🔴 Estoy grabando @{rec.user}. Te enviaré el video cuando termine.", parse_mode=None
+                        ))
+                    except Exception as e:
+                        log.warning("No pude enviar estado al usuario %s: %s", recipient, e)
             rec.status_task = asyncio.create_task(self._status_loop(rec))
         except Exception as e:
             log.warning("No pude enviar el cronómetro: %s", e)
@@ -2109,11 +2272,15 @@ class App:
                 self.cooldown[rec.id] = time.time() + 90
             if rec.sent:
                 await self.notify(f"✅ Live de @{rec.user} guardado en Telegram ({rec.sent} parte/s).")
+                for recipient in rec.recipient_ids:
+                    await self.send_user_notice(recipient, f"✅ La grabación de @{rec.user} terminó. El video fue enviado a tu chat.")
             else:
                 self.fail_count[rec.id] = self.fail_count.get(rec.id, 0) + 1
                 if rec.id not in self.fail_notified:
                     self.fail_notified.add(rec.id)
                     await self.notify(rec.failure_text(ran))
+                    for recipient in rec.recipient_ids:
+                        await self.send_user_notice(recipient, f"⚠️ No se pudo completar la grabación de @{rec.user}. El administrador recibió los detalles del error.")
 
     async def handle_lives(self, lives):
         now = time.time()
@@ -2201,12 +2368,8 @@ class App:
         await asyncio.to_thread(self.state.save)
         self.chat = CFG.admin_id
 
-        self.client.add_event_handler(
-            self.on_message, events.NewMessage(incoming=True, from_users=CFG.admin_id)
-        )
-        self.client.add_event_handler(
-            self.on_callback, events.CallbackQuery(func=lambda e: e.sender_id == CFG.admin_id)
-        )
+        self.client.add_event_handler(self.on_message, events.NewMessage(incoming=True))
+        self.client.add_event_handler(self.on_callback, events.CallbackQuery())
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:

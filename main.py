@@ -152,7 +152,7 @@ def load_config():
         api_id=int(_env("TG_API_ID", required=True)),
         api_hash=_env("TG_API_HASH", required=True),
         bot_token=_env("TG_BOT_TOKEN", required=True),
-        chat_id=int(_env("TG_CHAT_ID", required=True)),   # grupo donde se suben los videos
+        chat_id=int(_env("TG_CHAT_ID", "0")),   # ya no se usa: todo llega a tu chat con el bot
         admin_id=int(_env("ADMIN_ID", required=True)),    # tu ID: solo tú puedes mandar comandos
         state_key=_env("STATE_KEY", required=True),       # clave para cifrar la sesión guardada
         ig_proxy=_env("IG_PROXY", ""),                    # opcional: http://user:pass@host:port
@@ -160,7 +160,8 @@ def load_config():
         pick_batch=int(_env("PICK_BATCH", "10")),          # perfiles marcados revisados por ronda
         poll=int(_env("POLL_SECONDS", "45")),             # cada cuántos seg. busca lives nuevos
         max_runtime=int(_env("MAX_RUNTIME_MIN", "345")) * 60,  # turno de GitHub (máx 6h)
-        segment=int(_env("SEGMENT_SECONDS", "1200")),     # partes de 20 min: salen a Telegram mientras el live sigue
+        segment=int(_env("SEGMENT_SECONDS", "3600")),     # un solo video por live hasta 1 hora
+        part_max_bytes=int(_env("PART_MAX_MB", "1850")) * 1_000_000,  # tope por video (Telegram: 2 GB)
         backfill_max=int(_env("BACKFILL_SEGMENTS", "6000")),  # cuántos segmentos viejos bajar al detectar tarde
         data_dir=_env("DATA_DIR", "data"),
         rec_dir=_env("REC_DIR", "recordings"),
@@ -389,7 +390,8 @@ class State:
             "ig_settings": None,   # sesión de Instagram
             "ig_user": None,
             "tg_session": "",      # sesión del bot de Telegram
-            "topics": {},          # usuario -> id del tema en el grupo
+            "topics": {},          # (en desuso)
+            "library": {},         # usuario -> videos guardados en este chat (id, fecha, duración, peso)
             "only": [],            # si no está vacío: solo se graban estos
             "pks": {},             # usuario -> id numérico (caché)
             "following": None,     # cuántas cuentas sigues (se actualiza solo)
@@ -763,6 +765,21 @@ class Instagram:
                             "user": link["user"]})
         return out
 
+    def account_details(self, username):
+        """Datos públicos de una cuenta: seguidores, publicaciones, etc."""
+        u = self.cl.user_info_by_username_v1(username)
+        try:
+            self.state.data["pks"][username] = str(u.pk)
+        except Exception:
+            pass
+        return {
+            "user": u.username, "name": u.full_name or "", "bio": u.biography or "",
+            "followers": u.follower_count, "following": u.following_count, "posts": u.media_count,
+            "private": bool(u.is_private), "verified": bool(u.is_verified),
+            "category": getattr(u, "category", None) or "",
+            "url": str(getattr(u, "external_url", None) or ""),
+        }
+
     def refresh_following(self):
         """Cuántas cuentas sigues ahora mismo (None si no se pudo saber)."""
         try:
@@ -824,6 +841,7 @@ class Recording:
         self.rec_seconds = 0.0
         self._upl_tasks = []
         self.finished = False
+        self.uploading = 0
         self.status_msg = None
         self.status_task = None
 
@@ -1016,7 +1034,7 @@ class Recording:
             if code == 200 and data:
                 with open(path, "wb") as f:
                     f.write(data)
-                return True
+                return len(data)
             return False
 
         vinit = os.path.join(segdir, "v_init")
@@ -1032,15 +1050,17 @@ class Recording:
 
         async def grab(num, t, dur):
             vp = os.path.join(segdir, f"v_{num:09d}")
-            if not await dl(segment_url(vrep, num, t), vp):
+            vsz = await dl(segment_url(vrep, num, t), vp)
+            if not vsz:
                 return False
-            ap = None
+            ap, asz = None, 0
             if arep:
                 ap = os.path.join(segdir, f"a_{num:09d}")
-                if not await dl(segment_url(arep, num, a_map.get(num)), ap):
+                asz = await dl(segment_url(arep, num, a_map.get(num)), ap)
+                if not asz:
                     os.remove(vp)
                     return False
-            done[num] = {"v": vp, "a": ap, "dur": dur}
+            done[num] = {"v": vp, "a": ap, "dur": dur, "size": vsz + asz}
             return True
 
         # 1) hacia atrás: los segmentos anteriores siguen disponibles por número
@@ -1081,7 +1101,7 @@ class Recording:
                 else:
                     fails[num] = fails.get(num, 0) + 1
                     if fails[num] >= 6:
-                        done[num] = {"v": None, "a": None, "dur": 0}   # hueco irrecuperable
+                        done[num] = {"v": None, "a": None, "dur": 0, "size": 0}   # hueco irrecuperable
                     else:
                         break
             self.rec_seconds = sum(x["dur"] for x in done.values()) + cum
@@ -1116,16 +1136,18 @@ class Recording:
         return self.method == "segmentos"
 
     async def _assemble_ready(self, done, asm_next, cum, vinit, ainit, final):
-        """Junta los segmentos completos en partes (cada CFG.segment segundos) y las sube."""
+        """Junta los segmentos en un video: se corta al llegar a 1 hora o al tope de tamaño de Telegram."""
         while True:
-            nums, acc, n = [], 0.0, asm_next
+            nums, acc, size, n, reached = [], 0.0, 0, asm_next, False
             while n in done:
                 nums.append(n)
                 acc += done[n]["dur"]
+                size += done[n].get("size", 0)
                 n += 1
-                if acc >= CFG.segment:
+                if acc >= CFG.segment or size >= CFG.part_max_bytes:
+                    reached = True
                     break
-            if not nums or (acc < CFG.segment and not final):
+            if not nums or (not reached and not final):
                 break
             await self._assemble(nums, done, vinit, ainit, cum)
             cum += acc
@@ -1281,7 +1303,13 @@ class Recording:
                 f"⏱ {fmt_dur(d)} · 📦 {fmt_size(os.path.getsize(p))} · 📺 {pw}x{ph}{extra}\n"
                 f"#{tag_user} #{tag_date}"
             )
-            ok = await self.app.upload_video(self.user, p, caption, d, pw, ph, thumb)
+            self.uploading += 1
+            try:
+                meta = {"kind": "live", "when": part_start.isoformat(), "size": os.path.getsize(p),
+                        "part": (f"{part_no}.{i + 1}" if len(pieces) > 1 else part_no)}
+                ok = await self.app.upload_video(self.user, p, caption, d, pw, ph, thumb, meta)
+            finally:
+                self.uploading -= 1
             if ok:
                 self.sent += 1
                 os.remove(p)
@@ -1313,13 +1341,14 @@ class App:
         self.stop_event = asyncio.Event()
         self.topic_lock = asyncio.Lock()
         self.upload_sem = asyncio.Semaphore(2)
-        self.use_topics = True
+        self.use_topics = False    # todo llega al chat privado con el bot
         self.session_alert_sent = False
         self.pending = None       # lo que espera el menú (enlace, usuarios…)
         self.unparsed_seen = set()
         self.fail_count = {}
         self.fail_notified = set()
         self.last_sent = None
+        self.acc_cache = {}
         self.client.parse_mode = "html"
 
     # ---------- Telegram ----------
@@ -1344,11 +1373,11 @@ class App:
 
     async def ensure_topic(self, user):
         async with self.topic_lock:
+            if not self.use_topics:
+                return None
             topics = self.state.data["topics"]
             if user in topics:
                 return topics[user]
-            if not self.use_topics:
-                return None
             try:
                 res = await self.client(make_topic_request(self.chat, f"@{user}"))
                 tid = None
@@ -1375,7 +1404,7 @@ class App:
                 )
                 return None
 
-    async def upload_video(self, user, path, caption, dur, w, h, thumb):
+    async def upload_video(self, user, path, caption, dur, w, h, thumb, meta=None):
         async with self.upload_sem:
             for attempt in range(1, 4):
                 try:
@@ -1387,11 +1416,11 @@ class App:
                         force_document=False, part_size_kb=512, parse_mode=None,
                     )
                     self.last_sent = sent
+                    if meta:
+                        await self.library_add(user, sent, dur, meta)
                     return True
                 except Exception as e:
                     log.warning("Subida falló (intento %d): %s", attempt, e)
-                    if "TOPIC" in str(e).upper():
-                        self.state.data["topics"].pop(user, None)   # tema borrado: se recrea
                     await asyncio.sleep(5 * attempt)
             return False
 
@@ -1431,7 +1460,7 @@ class App:
         self.notified.add(b["id"])
         return (f"🔴 Grabando el live de @{html.escape(b['username'])} en máxima calidad…\n"
                 f"(encontrado por: {html.escape(str(b.get('via') or '?'))})\n"
-                "El video llega al grupo cuando termine el live. Si algo falla, te aviso aquí.")
+                "El video llega a este chat cuando termine el live. Si algo falla, te aviso aquí.")
 
     # ---------- conteo de cuentas que sigues (automático) ----------
     async def refresh_following(self, force=False):
@@ -1481,7 +1510,8 @@ class App:
         if rec.quality:
             opts = ", ".join(rec.qual_options)
             lines.append(f"🎞 Calidad: {rec.quality} (disponibles: {opts}; manifiestos probados: {rec.n_manifests})")
-        lines.append(f"📦 Partes subidas a Telegram: {rec.sent}")
+        up = f" · 📤 subiendo {rec.uploading}" if rec.uploading else ""
+        lines.append(f"📦 Videos subidos a Telegram: {rec.sent}{up}")
         lines.append(f"🔎 Detectado por: {rec.via or '?'} · método: {rec.method or 'iniciando…'}")
         return "\n".join(lines)
 
@@ -1542,7 +1572,8 @@ class App:
                               "-frames:v", "1", "-vf", "scale=320:-1", thumb)
                 if not os.path.exists(thumb):
                     thumb = None
-                ok = await self.upload_video(user, path, caption, dur, w, h, thumb)
+                meta = {"kind": f["type"], "when": now.isoformat(), "size": os.path.getsize(path)}
+                ok = await self.upload_video(user, path, caption, dur, w, h, thumb, meta)
             else:
                 ok = await self.upload_photo(user, path, caption)
             if ok:
@@ -1554,23 +1585,8 @@ class App:
                     os.remove(p)
         return sent, msgs
 
-    async def handle_link(self, text):
-        """Lo que se hace al recibir un enlace: grabar un live o descargar lo que haya."""
-        link = classify_link(text)
-        kind = link["kind"]
-        if kind == "live":
-            return await self.record_target(text)
-        if kind == "none":
-            return "❌ No entendí el enlace. Envía un enlace de Instagram (live, historia, publicación o reel)."
-        if not self.ig.ok:
-            return "❌ Primero inicia sesión en Instagram (menú → 🔑 Sesión IG)."
-        if kind == "highlight":
-            return "ℹ️ Los destacados todavía no los descargo. Pega el enlace de una historia o una publicación."
-        if kind == "profile":
-            r = await self.record_target(text)       # ¿está en vivo?
-            if r[:1] in ("🔴", "ℹ", "❌"):
-                return r
-            link["kind"] = "stories_user"             # si no, sus historias actuales
+    async def download_link(self, link):
+        """Descarga historias, publicaciones o reels y los manda a este chat. Devuelve el texto de respuesta."""
         workdir = os.path.join(CFG.rec_dir, "_descargas", datetime.now().strftime("%H%M%S%f"))
         try:
             files = await asyncio.to_thread(self.ig.fetch_content, link, workdir)
@@ -1580,30 +1596,127 @@ class App:
         if not files:
             shutil.rmtree(workdir, ignore_errors=True)
             return "⚪ No encontré nada que descargar (¿cuenta privada o sin historias activas?)."
-        n, msgs = await self.deliver_files(files)
+        n, _ = await self.deliver_files(files)
         shutil.rmtree(workdir, ignore_errors=True)
         if n == 0:
-            return "❌ Descargué el contenido, pero no pude subirlo a Telegram."
-        # copia en este chat (reenvío instantáneo, sin volver a subir) y enlace al mensaje del grupo
+            return "❌ Descargué el contenido, pero no pude enviarlo."
+        return f"✅ Listo: {n} de {len(files)} archivo(s) de @{html.escape(files[0]['user'])} enviados aquí abajo."
+
+    async def handle_link(self, text):
+        """Lo que se hace al recibir un enlace o una cuenta. Devuelve (texto, botones o None)."""
+        link = classify_link(text)
+        kind = link["kind"]
+        if kind == "live":
+            return await self.record_target(text), None
+        if kind == "none":
+            return "❌ No entendí el enlace. Envía un enlace de Instagram (cuenta, live, historia, publicación o reel).", None
+        if not self.ig.ok:
+            return "❌ Primero inicia sesión en Instagram (menú → 🔑 Sesión IG).", None
+        if kind == "highlight":
+            return "ℹ️ Los destacados todavía no los descargo. Pega el enlace de una historia o una publicación.", None
+        if kind == "profile" and link["user"]:
+            return self.account_menu(link["user"])
+        return await self.download_link(link), None
+
+    # ---------- biblioteca de videos y menú por cuenta ----------
+    @staticmethod
+    def _num(n):
         try:
-            await self.client.forward_messages(CFG.admin_id, [m.id for _, m in msgs], from_peer=self.chat)
-        except Exception as e:
-            log.warning("No pude reenviar la copia al chat privado: %s", e)
-        links = " · ".join(
-            f'<a href="{self.message_link(u, m)}">abrir #{i + 1}</a>' for i, (u, m) in enumerate(msgs)
-        )
-        return (f"✅ Listo: {n} de {len(files)} archivo(s) de @{html.escape(files[0]['user'])}.\n"
-                f"Quedó guardado en el grupo (tema @{html.escape(files[0]['user'].lower())}) y te mandé una copia aquí abajo.\n"
-                f"🔗 {links}")
+            return f"{int(n):,}".replace(",", ".")
+        except Exception:
+            return "?"
+
+    def _when(self, iso):
+        try:
+            return datetime.fromisoformat(iso).astimezone(CFG.tz).strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            return "?"
+
+    async def library_add(self, user, sent, dur, meta):
+        lib = self.state.data.setdefault("library", {})
+        lib.setdefault(user.lower(), []).append({
+            "id": sent.id, "when": meta.get("when"), "kind": meta.get("kind", "live"),
+            "dur": int(dur or 0), "size": int(meta.get("size") or 0), "part": meta.get("part"),
+        })
+        await asyncio.to_thread(self.state.save)
+
+    def account_menu(self, user):
+        n = len(self.state.data.get("library", {}).get(user, []))
+        text = (f"👤 <b>@{html.escape(user)}</b>\n"
+                f"📼 Videos guardados aquí: <b>{n}</b>\n\n¿Qué quieres hacer?")
+        B = Button.inline
+        return text, [
+            [B("🔴 Grabar", f"accrec:{user}".encode()), B("📼 Videos grabados", f"acclist:{user}:0".encode())],
+            [B("ℹ️ Información", f"accinfo:{user}".encode()), B("📥 Historias", f"accstories:{user}".encode())],
+            [B("⬅️ Menú", b"menu")],
+        ]
+
+    async def account_info_text(self, user, force=False):
+        cached = self.acc_cache.get(user)
+        if cached and not force and time.time() - cached[0] < 600:
+            info = cached[1]
+        else:
+            if not self.ig.ok:
+                return "❌ Primero inicia sesión en Instagram (🔑 Sesión IG)."
+            try:
+                info = await asyncio.to_thread(self.ig.account_details, user)
+            except Exception as e:
+                return "❌ No pude leer la cuenta: " + html.escape(str(e)[:200])
+            self.acc_cache[user] = (time.time(), info)
+        e = html.escape
+        lines = [f"👤 <b>@{e(info['user'])}</b>" + (" ✔️" if info["verified"] else "")]
+        if info["name"]:
+            lines.append(f"📛 {e(info['name'])}")
+        lines.append("━━━━━━━━━━━━━━")
+        lines += [
+            f"👥 Seguidores: <b>{self._num(info['followers'])}</b>",
+            f"➡️ Siguiendo: <b>{self._num(info['following'])}</b>",
+            f"🖼 Publicaciones: <b>{self._num(info['posts'])}</b>",
+            f"🔒 Cuenta: {'privada' if info['private'] else 'pública'}",
+        ]
+        if info["category"]:
+            lines.append(f"🏷 Categoría: {e(info['category'])}")
+        if info["url"]:
+            lines.append(f"🔗 {e(info['url'])}")
+        if info["bio"]:
+            lines.append(f"📝 {e(info['bio'][:300])}")
+        lines.append("━━━━━━━━━━━━━━")
+        return "\n".join(lines)
+
+    def library_screen(self, user, page):
+        B = Button.inline
+        back = [B("⬅️ Cuenta", f"acc:{user}".encode())]
+        lib = list(reversed(self.state.data.get("library", {}).get(user, [])))
+        if not lib:
+            return f"📼 <b>@{html.escape(user)}</b>\n\nTodavía no hay videos guardados de esta cuenta.", [back]
+        PAGE = 6
+        pages = max(1, math.ceil(len(lib) / PAGE))
+        page = min(max(page, 0), pages - 1)
+        total = sum(x.get("size", 0) for x in lib)
+        rows = []
+        for x in lib[page * PAGE:(page + 1) * PAGE]:
+            icon = "🔴" if x.get("kind") == "live" else "📥"
+            part = f" · p{x['part']}" if x.get("part") else ""
+            label = f"{icon} {self._when(x.get('when'))} · {fmt_dur(x.get('dur', 0))} · {fmt_size(x.get('size', 0))}{part}"
+            rows.append([B(label, f"play:{x['id']}".encode())])
+        nav = []
+        if page > 0:
+            nav.append(B("◀️", f"acclist:{user}:{page - 1}".encode()))
+        nav.append(B(f"{page + 1}/{pages}", b"noop"))
+        if page < pages - 1:
+            nav.append(B("▶️", f"acclist:{user}:{page + 1}".encode()))
+        rows += [nav, back]
+        return (f"📼 <b>@{html.escape(user)}</b>\n{len(lib)} videos · {fmt_size(total)}\n"
+                "Toca uno para recibirlo aquí (más nuevos primero)."), rows
 
     # ---------- diseño: menú con botones ----------
     HELP = (
         "❓ <b>Ayuda</b>\n\n"
         "• <b>Automático:</b> graba solo los lives de las cuentas que sigues.\n"
-        "• <b>Por enlace:</b> pega un enlace de Instagram sin ningún comando: live (lo grabo), historia, publicación o reel (lo descargo y lo subo al grupo).\n"
+        "• <b>Por enlace o cuenta:</b> pega el enlace o @usuario de una cuenta y te pregunto qué hacer (grabar, ver sus videos guardados con fecha y hora, información). Un enlace de live lo graba; de historia, publicación o reel lo descarga.\n"
         "• Mientras graba verás un cronómetro que se actualiza solo, con el tiempo grabado y lo que lleva el live.\n"
         "• <b>Perfiles a grabar:</b> marca tus cuentas favoritas de la lista de las que sigues; el bot las revisa una por una, además de la detección general.\n"
-        "• Los videos llegan al grupo, un tema por usuario, con fecha y hora.\n\n"
+        "• Los videos llegan a este chat. En 📚 Biblioteca los ves por cuenta, con fecha y hora.\n\n"
         "<b>Comandos:</b>\n"
         "/menu · /estado · /siguiendo · /diag · /grabar enlace\n"
         "/login usuario clave [2FA] · /sessionid VALOR\n"
@@ -1637,9 +1750,9 @@ class App:
         B = Button.inline
         return [
             [B("📊 Estado", b"estado"), B("🔴 En vivo ahora", b"vivo")],
-            [B("🔗 Grabar enlace", b"grabar"), B("🔑 Sesión IG", b"sesion")],
-            [B("📋 Perfiles a grabar", b"perfiles"), B("🩺 Diagnóstico", b"diag")],
-            [B("❓ Ayuda", b"ayuda")],
+            [B("🔗 Enlace o cuenta", b"grabar"), B("📚 Biblioteca", b"lib")],
+            [B("📋 Perfiles a grabar", b"perfiles"), B("🔑 Sesión IG", b"sesion")],
+            [B("🩺 Diagnóstico", b"diag"), B("❓ Ayuda", b"ayuda")],
         ]
 
     def estado_text(self):
@@ -1689,14 +1802,42 @@ class App:
         if key == "grabar":
             self.pending = "grabar"
             return (
-                "🔗 <b>Grabar o descargar por enlace</b>\n\n"
-                "Envíame un enlace de Instagram:\n"
-                "• <b>Live</b> → lo grabo (si está en vivo ahora).\n"
-                "• <b>Historia, publicación o reel</b> → lo descargo y lo subo al grupo.\n"
-                "• <b>Perfil</b> → si está en vivo lo grabo; si no, bajo sus historias actuales.\n\n"
-                "Ejemplos:\n<code>https://www.instagram.com/usuario/live/</code>\n<code>https://www.instagram.com/reel/XXXX/</code>\n<code>@usuario</code>\n\n"
-                "También puedes pegar un enlace en cualquier momento, sin abrir este menú."
+                "🔗 <b>Enlace o cuenta</b>\n\n"
+                "Envíame:\n"
+                "• El <b>enlace o @usuario de una cuenta</b> → te muestro qué puedo hacer: grabar su live, "
+                "ver los videos guardados con fecha y hora, o ver su información.\n"
+                "• Un <b>enlace de live</b> → lo grabo (si está en vivo ahora).\n"
+                "• Un <b>enlace de historia, publicación o reel</b> → lo descargo y te lo mando aquí.\n\n"
+                "Ejemplos:\n<code>https://www.instagram.com/usuario/</code>\n<code>@usuario</code>"
             ), [back]
+        if key == "lib":
+            lib = d.get("library", {})
+            if not lib:
+                return "📚 <b>Biblioteca</b>\n\nTodavía no hay videos guardados.", [back]
+            rows = []
+            ordered = sorted(lib.items(), key=lambda kv: max((x.get("when") or "") for x in kv[1]), reverse=True)
+            for u, items in ordered[:30]:
+                total = sum(x.get("size", 0) for x in items)
+                rows.append([B(f"👤 @{u} · {len(items)} · {fmt_size(total)}", f"acc:{u}".encode())])
+            return "📚 <b>Biblioteca</b>\n\nElige una cuenta:", rows + [back]
+        if key.startswith("acc:"):
+            return self.account_menu(key[4:])
+        if key.startswith("accinfo:") or key.startswith("accrefresh:"):
+            u = key.split(":", 1)[1]
+            text = await self.account_info_text(u, force=key.startswith("accrefresh:"))
+            return text, [[B("🔄 Actualizar", f"accrefresh:{u}".encode())], [B("⬅️ Cuenta", f"acc:{u}".encode())]]
+        if key.startswith("acclist:"):
+            _, u, pg = key.split(":", 2)
+            return self.library_screen(u, int(pg or 0))
+        if key.startswith("accrec:"):
+            u = key.split(":", 1)[1]
+            return await self.record_target("@" + u), [[B("⬅️ Cuenta", f"acc:{u}".encode())]]
+        if key.startswith("accstories:"):
+            u = key.split(":", 1)[1]
+            if not self.ig.ok:
+                return "❌ Primero inicia sesión en Instagram (🔑 Sesión IG).", [[B("⬅️ Cuenta", f"acc:{u}".encode())]]
+            text = await self.download_link({"kind": "stories_user", "user": u, "url": None})
+            return text, [[B("⬅️ Cuenta", f"acc:{u}".encode())]]
         if key.startswith("perfiles"):
             if not self.ig.ok:
                 return "❌ Primero inicia sesión en Instagram (🔑 Sesión IG).", [back]
@@ -1777,6 +1918,17 @@ class App:
         self.pending = None
         if data == "noop":
             return
+        if data.startswith("play:"):
+            mid = int(data[5:])
+            try:
+                await self.client.forward_messages(CFG.admin_id, [mid], from_peer=CFG.admin_id)
+            except Exception as e:
+                log.warning("No pude reenviar el video %s: %s", mid, e)
+                for items in self.state.data.get("library", {}).values():
+                    items[:] = [x for x in items if x.get("id") != mid]
+                await asyncio.to_thread(self.state.save)
+                await self.notify("⚠️ No pude enviarte ese video (¿lo borraste del chat?). Lo quité de la lista.")
+            return
         if data.startswith("pick:"):
             _, u, pg = data.split(":", 2)
             picks = self.state.data.setdefault("picks", [])
@@ -1828,9 +1980,10 @@ class App:
         back = [self._back()]
         if pend in ("sessionid", "login") and not event.is_private:
             return
-        if pend == "grabar" or (pend is None and LINK_RE.search(text)):
+        if pend == "grabar" or (pend is None and (LINK_RE.search(text) or re.fullmatch(r"@[A-Za-z0-9._]{1,30}", text))):
             msg = await event.reply("⏳ Trabajando en tu enlace…")
-            await msg.edit(await self.handle_link(text), buttons=back)
+            out, btns = await self.handle_link(text)
+            await msg.edit(out, buttons=btns or back)
         elif pend == "solo":
             d["only"] = self._names(text)
             await asyncio.to_thread(self.state.save)
@@ -1874,7 +2027,8 @@ class App:
             if not args:
                 return await reply("Uso: /grabar enlace_del_live  (o /grabar @usuario)")
             msg = await reply("⏳ Trabajando en tu enlace…")
-            await msg.edit(await self.handle_link(" ".join(args)), buttons=back)
+            out, btns = await self.handle_link(" ".join(args))
+            await msg.edit(out, buttons=btns or back)
         elif cmd == "/login":
             if not event.is_private:
                 return await reply("Por seguridad usa /login solo en chat privado conmigo.")
@@ -2045,7 +2199,7 @@ class App:
         await self.client.start(bot_token=CFG.bot_token)
         self.state.data["tg_session"] = self.client.session.save()
         await asyncio.to_thread(self.state.save)
-        self.chat = await self.resolve_chat()
+        self.chat = CFG.admin_id
 
         self.client.add_event_handler(
             self.on_message, events.NewMessage(incoming=True, from_users=CFG.admin_id)
